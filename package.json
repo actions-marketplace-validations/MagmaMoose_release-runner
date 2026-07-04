@@ -17,6 +17,6 @@
   },
   "devDependencies": {
     "bats": "^1.13.0",
-    "markdownlint-cli2": "^0.22.1"
+    "markdownlint-cli2": "^0.23.0"
   }
 }
