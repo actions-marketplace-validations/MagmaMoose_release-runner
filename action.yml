@@ -606,7 +606,7 @@ runs:
 
     # ── 2. Checkout ─────────────────────────────────────────────────────────
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@v7.0.0
       with:
         fetch-depth: 0
         fetch-tags: true
@@ -659,15 +659,15 @@ runs:
 
     - name: Set up QEMU
       if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+      uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
     - name: Set up Docker Buildx (CI)
       if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
     - name: Log in to container registry (CI)
       if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
       with:
         registry: ${{ inputs.registry }}
         username: ${{ inputs.registry-username || github.actor }}
@@ -929,7 +929,7 @@ runs:
 
     - name: Set up Node.js (semantic-release-npm)
       if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'semantic-release-npm'
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: '20'
 
@@ -1424,11 +1424,11 @@ runs:
 
     - name: Set up Docker Buildx (release)
       if: inputs.mode == 'release' && inputs.image_name != '' && steps.normalize.outputs.released == 'true'
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
     - name: Log in to container registry (release)
       if: inputs.mode == 'release' && inputs.image_name != '' && steps.normalize.outputs.released == 'true'
-      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
       with:
         registry: ${{ inputs.registry }}
         username: ${{ inputs.registry-username || github.actor }}
