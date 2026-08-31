@@ -1,38 +1,43 @@
-<p align="center">
-  <img src="release-runner-logo.png" alt="Release Runner" width="200">
-</p>
+# Diatreme
 
-# Release Runner
+**Diatreme is a release/deployment orchestrator.** It has two independent surfaces
+in one repository that communicate over HTTP, neither imports the other:
 
-Release Runner is the GitHub Marketplace Action published as
-`calebsargeant/semantic-release@v1`.
+- **Composite action** (`action.yml` + `scripts/`), published to the GitHub
+  Marketplace. Runs semantic versioning, GitHub Releases, Docker image build and
+  promotion, image scanning with SBOM/finding routing, and promotion-PR automation.
+- **Hosted broker**, the GitHub App backend at `api.diatreme.magmamoose.com`.
+  An OIDC to installation-token broker and an App-attributed commit and tag
+  signer. Most users never touch it directly. `worker/` in this repository is
+  its TypeScript implementation; see [Deployment](operations/deployment.md) for
+  what actually serves that hostname.
 
-It creates semantic version releases from GitHub Actions. It can also build pull
-request Docker images and promote or rebuild those images with release tags in
-GHCR.
+Install the action:
 
-## Start Here
+```yaml
+- uses: MagmaMoose/diatreme@v2
+  with:
+    mode: release
+```
 
-| If you need | Read |
-|---|---|
-| A quick Marketplace usage example | [GitHub README](https://github.com/calebsargeant/semantic-release) |
-| The concepts behind the action | [Concepts](concepts.md) |
-| Organization-level auth setup | [Organization setup](organization-setup.md) |
-| Which inputs match your release flow | [Choose your setup](choose-your-setup.md) |
-| Files and workflows to add to a repository | [Repository setup](repository-setup.md) |
-| Every supported input and output | [Action inputs and outputs](reference/action-inputs-outputs.md) |
+!!! tip "Where to go next"
+    - New here? Start with **[Setup](setup.md)**.
+    - Want the big picture? See **[Architecture](architecture.md)**.
+    - Configuring a pipeline? See **[Using the action](action.md)**.
+    - Hit a red X? Go straight to **[Errors](reference/errors.md)**.
+    - Running your own broker? See **[Broker configuration](reference/configuration.md)**.
+    - The full, exhaustive input/output reference lives in the
+      [repository README](https://github.com/MagmaMoose/diatreme#readme).
 
-## Common Setups
+## The two surfaces at a glance
 
-| Goal | Setup |
-|---|---|
-| Create stable tags from `main` | Production-only release |
-| Build and tag GHCR images | PR CI with `mode: ci`, release with `image_name` |
-| Release `dev`, `staging`, and `prod` from one branch | Trunk-Based Development with promotion PRs |
-| Release from long-lived environment branches | Branch-Based Development with `branch-map` |
+| Surface | Path | Toolchain | Ships to |
+| --- | --- | --- | --- |
+| Composite action | `action.yml` + `scripts/*.sh` | Bash, `actionlint`, `shellcheck`, `bats` | GitHub Marketplace |
+| Broker (production) | `broker/` | Python, `pytest`, `boto3` | AWS Lambda, eu-west-1 |
+| Broker (legacy) | `worker/` | TypeScript, `wrangler`, `vitest` | Rollback target (not currently serving) |
 
-The recommended path for a new repository is:
+## Related
 
-1. read [Concepts](concepts.md)
-2. choose a flow in [Choose your setup](choose-your-setup.md)
-3. add the files from [Repository setup](repository-setup.md)
+- **[MagmaMoose/diatreme-pro](https://github.com/MagmaMoose/diatreme-pro)**: the
+  separate private observability dashboard (release/run history) for the worker.

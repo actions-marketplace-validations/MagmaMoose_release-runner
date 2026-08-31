@@ -1,30 +1,31 @@
-# Release Runner
+# Diatreme
 
-<p align="center">
-  <img src="docs/release-runner-logo.png" alt="Release Runner" width="200">
-</p>
+[![CI](https://github.com/MagmaMoose/diatreme/actions/workflows/ci.yaml/badge.svg)](https://github.com/MagmaMoose/diatreme/actions/workflows/ci.yaml)
+[![Latest release](https://img.shields.io/github/v/release/MagmaMoose/diatreme?sort=semver&logo=github)](https://github.com/MagmaMoose/diatreme/releases/latest)
+[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-Diatreme-purple?logo=github)](https://github.com/marketplace/actions/diatreme)
+[![Docs](https://img.shields.io/badge/docs-diatreme-purple)](https://magmamoose.github.io/diatreme/)
+[![License](https://img.shields.io/github/license/MagmaMoose/diatreme)](LICENSE)
 
-[![CI](https://github.com/magmamoose/release-runner/actions/workflows/ci.yaml/badge.svg)](https://github.com/magmamoose/release-runner/actions/workflows/ci.yaml)
-[![Release](https://github.com/magmamoose/release-runner/actions/workflows/release.yaml/badge.svg)](https://github.com/magmamoose/release-runner/actions/workflows/release.yaml)
-[![Docs](https://github.com/magmamoose/release-runner/actions/workflows/docs-pages.yaml/badge.svg)](https://releaserunner.dev/docs)
-[![GitHub Marketplace](https://img.shields.io/badge/Marketplace-Release%20Runner-purple?logo=github)](https://github.com/marketplace/actions/release-runner)
-[![License](https://img.shields.io/github/license/magmamoose/release-runner)](https://github.com/magmamoose/release-runner/blob/main/LICENSE)
+> *One GitHub Action for your whole release spine: versioning, releases, signed commits,
+> Docker promotion, and SBOMs, on both GitHub.com and Enterprise.*
 
-Instead of composing `cycjimmy/semantic-release-action` + `docker/metadata-action` + `cloudposse/github-action-docker-promote` + ~200 lines of glue YAML, use one action.
+Merge a conventional commit and Diatreme computes the semantic version, writes the tag,
+GitHub Release and changelog, promotes your already-built Docker image by
+provenance-verified retag, and emits a CycloneDX SBOM. The same workflow serves a mixed
+stack: python-semantic-release, semantic-release, GitVersion and release-please are all
+detected from repository markers, so a whole org shares one release job.
 
-<!-- TODO: 30-second GIF showing PR→merge→release→Docker promotion -->
+**[Documentation](https://magmamoose.github.io/diatreme/)** ·
+[Install the GitHub App](https://github.com/apps/diatreme/installations/new) ·
+[Action reference](https://magmamoose.github.io/diatreme/reference/action/) ·
+[Marketplace](https://github.com/marketplace/actions/diatreme)
 
-I run release management across three different orgs. I got tired of composing `cycjimmy/semantic-release-action` plus `docker/metadata-action` plus `cloudposse/github-action-docker-promote` plus 200 lines of glue YAML in every repo. So I built Release Runner — one action that consolidates the lot, with the multi-environment and promotion-PR patterns I actually needed in production.
+## Quickstart
 
-Release Runner runs my production releases today. If you're managing release tooling across multiple repos or orgs and you're tired of the same dance every time, this is for you.
-
-## 60-Second Quickstart
-
-A production-only release from `main`, using the Release Runner GitHub App:
+Production-only release from `main`, using the hosted App token broker:
 
 ```yaml
 name: Release
-
 on:
   push:
     branches: [main]
@@ -34,73 +35,85 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write     # exchanges GitHub OIDC for a short-lived installation token
     steps:
-      - uses: magmamoose/release-runner@v1
+      - uses: MagmaMoose/diatreme@v2
         with:
           environment: prod
           environments: '["prod"]'
           prerelease-identifiers: '{}'
 ```
 
-Install the [Release Runner GitHub App](https://github.com/apps/release-runner/installations/new) on the repo or org, add a `pyproject.toml` (default tool: `python-semantic-release`), and merge a conventional commit. You get a Git tag, a GitHub Release, and a `CHANGELOG.md` entry.
+Install the [Diatreme GitHub App](https://github.com/apps/diatreme/installations/new),
+add your versioning tool's config, and merge conventional commits. Nothing to register,
+no token to rotate.
 
-### Scale up
+## What it does
 
-- **Docker image promotion** — add `packages: write` and `image_name: my-app`, plus a `docker-bake.hcl`. PR builds land at `pr-<N>`; merges retag to the release version, no rebuild.
-- **Multiple environments** — switch to `environments: '["dev", "staging", "prod"]'`, set `prerelease-identifiers`, and run in `deployment-model: tbd-pr` with `create-promotion-pr: 'true'` so each release publish opens the promotion PR for the next environment. See [Choose your setup](https://releaserunner.dev/docs/choose-your-setup/) for the full caller workflow (the initial push trigger needs an explicit `environment` for the first env in the chain).
-- **Concurrent triggers** (push + promotion-PR merges on the same branch) — swap the `uses:` line for the bundled reusable workflow:
+- **Versioning, your way** — auto-detects python-semantic-release, semantic-release,
+  GitVersion or release-please from repo markers, so one shared workflow serves a
+  mixed-stack org.
+- **Releases** — tag, GitHub Release, changelog and normalised outputs, with App-attributed
+  **signed** release commits.
+- **Docker, promoted not rebuilt** — build `pr-N` images, then promote the *exact scanned
+  artifact* to the release tag by digest, verifying provenance first.
+- **Supply chain built in** — scan the assembled image and route a CycloneDX SBOM to
+  Dependency-Track, with optional findings to DefectDojo.
+- **Publish anywhere** — npm, NuGet, Maven, Gradle, RubyGems, containers and pip, to
+  GitHub Packages or public registries.
+- **Multi-environment promotion** — dev → staging → prod with promotion PRs and native
+  auto-merge.
 
-  ```yaml
-  jobs:
-    release:
-      uses: magmamoose/release-runner/.github/workflows/release-runner.yaml@v1
-      permissions:
-        contents: read
-        id-token: write
-      with:
-        environment: prod
-        environments: '["prod"]'
-        prerelease-identifiers: '{}'
-  ```
+> **A wrong `tag-prefix` ships the wrong version, silently.** In a repo releasing several
+> packages, nothing errors: the release succeeds and the artifact publishes carrying a
+> version computed from another package's history. See
+> [Releasing several packages](https://magmamoose.github.io/diatreme/how-to/release-several-packages/).
 
-  Same inputs; adds an automatic `concurrency: release-runner-<target-branch>` lock with FIFO queueing.
+```mermaid
+flowchart LR
+  C[Conventional commits] --> D{Diatreme}
+  D -->|version| R[Tag · GitHub Release · Changelog]
+  D -->|docker| I[Build pr-N → Scan → SBOM → Promote by digest]
+  D -->|packages| P[npm · NuGet · Maven · Gradle · pip · gem]
+  I --> DT[(Dependency-Track)]
+  I --> DD[(DefectDojo)]
+```
 
-## What You Get
+## Most-used inputs
 
-- **Four versioning backends behind one input.** `versioning-tool: semantic-release-npm | semantic-release-python | gitversion | release-please` — swap without touching anything else.
-- **Retag-not-rebuild Docker promotion.** The image that passed PR CI as `pr-42` becomes `v1.2.3` via registry retag. No fresh build, no binary drift between staging and prod. Falls back to a Docker Bake rebuild only when the source image is missing.
-- **Per-environment prerelease identifiers.** `{"dev":"dev","staging":"rc"}` → tags land as `v1.2.3-dev.1`, `v1.2.3-rc.1`, `v1.2.3`. Production sheds the suffix.
-- **Promotion PRs auto-open.** In `deployment-model: tbd-pr` with `create-promotion-pr: 'true'`, each release publish opens the promotion PR for the next environment. Merging `promote/staging/<version>` cuts the staging tag and opens `promote/prod/<version>`; merging that cuts the stable prod tag. The cascade chains through every entry in `environments`.
-- **ClickUp + GitHub Projects v2 in release notes.** Scans commits and PR bodies in the release range for `app.clickup.com/t/...` URLs and issue/PR refs (`#NNN`), appends grouped sections to the GitHub Release notes and to any open promotion PR body.
-- **Production guardrail on by default.** `admin-required-from: '@last'` makes manual `workflow_dispatch` runs targeting production require `permission: admin` on the repository. Push and promotion-PR-merge triggers are unaffected.
-- **Built-in concurrency lock.** The bundled reusable workflow declares `concurrency: release-runner-<target-branch>` with `cancel-in-progress: false`, so concurrent triggers on the same branch queue FIFO instead of racing the tag write. Composite actions can't do this on their own.
+| Input | Default | What it does |
+| --- | --- | --- |
+| `mode` | `release` | `ci` builds a PR image · `release` versions and promotes · `enable-auto-merge`. |
+| `auth-mode` | `public-app` | Token source. The default uses the hosted App and needs only `id-token: write`. |
+| `versioning-tool` | `auto` | Detected from repo markers; override to pin one. |
+| `environment` | — | The environment this run releases to. |
+| `publish-package` | — | Language package to publish: `npm` · `nuget` · `maven` · `pip` · … |
+| `tag-prefix` | — | Scopes the release when one repo ships several packages. |
 
-## Compared to Alternatives
+All 90 inputs and every output →
+**[Action reference](https://magmamoose.github.io/diatreme/reference/action/)**
 
-| Action | Versioning | Docker build | Promote (retag) | Multi-env prerelease | Promotion PRs | ClickUp | Projects v2 | Admin gate | Concurrency lock |
-|---|---|---|---|---|---|---|---|---|---|
-| **Release Runner** | all 4 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| cycjimmy/semantic-release-action | semantic-release (npm) | — | — | — | — | — | — | — | — |
-| codfish/semantic-release-action | semantic-release (npm) | — | — | — | — | — | — | — | — |
-| googleapis/release-please-action | release-please | — | — | — | — | — | — | — | — |
-| python-semantic-release publish action | python-semantic-release | — | — | — | — | — | — | — | — |
-| gittools/actions | GitVersion | — | — | — | — | — | — | — | — |
-| @codedependant/semantic-release-docker | sr-npm (plugin) | ✓ | — | — | — | — | — | — | — |
-| cloudposse/github-action-docker-promote | — | — | ✓ | — | — | — | — | — | — |
-| Nextdoor/docker-image-retag-action | — | — | ✓ | — | — | — | — | — | — |
+## Documentation
 
-<sub>Best-effort comparison as of 2026-05-12; corrections welcome via PR.</sub>
+| | |
+| --- | --- |
+| [Setup](https://magmamoose.github.io/diatreme/setup/) | Install the App, wire the workflow, develop locally |
+| [Using the action](https://magmamoose.github.io/diatreme/action/) | Modes, Docker builds, image scanning, signing, publishing packages |
+| [Action reference](https://magmamoose.github.io/diatreme/reference/action/) | Every input and output, generated from `action.yml` |
+| [Architecture](https://magmamoose.github.io/diatreme/architecture/) · [Broker](https://magmamoose.github.io/diatreme/worker/) | How it works, and the Cloudflare Worker behind it |
+| [Errors](https://magmamoose.github.io/diatreme/reference/errors/) · [Limits](https://magmamoose.github.io/diatreme/reference/limits/) | What went wrong, and what it will not do |
 
-## Setup
+## Where it sits
 
-- [Concepts](https://releaserunner.dev/docs/concepts/) — TBD vs BBD, promotion PRs, Docker retag, the auth-token model.
-- [Choose your setup](https://releaserunner.dev/docs/choose-your-setup/) — paste-ready snippets for each release model.
-- [Repository setup](https://releaserunner.dev/docs/repository-setup/) — versioning config, `docker-bake.hcl`, PR CI, release workflow.
-- [Organization setup](https://releaserunner.dev/docs/organization-setup/) — installing the App, branch-protection bypass, when to fall back to `GITHUB_TOKEN`.
+**Diatreme** releases · [Tremvok](https://github.com/MagmaMoose/tremvok) deploys and
+verifies · [Chargate](https://github.com/MagmaMoose/chargate) gates security ·
+[Brimyr](https://github.com/MagmaMoose/brimyr) gates tests
 
-Full input/output reference: [Action reference](https://releaserunner.dev/docs/reference/action-inputs-outputs/).
+## Versioning
 
----
+Pin `@v2` for the floating major, or a tag or SHA to freeze.
 
-A Magma Moose product.
+## Security · Contributing · License
+
+[Report a vulnerability](SECURITY.md) · [Contributing](CONTRIBUTING.md) ·
+MIT, see [LICENSE](LICENSE).

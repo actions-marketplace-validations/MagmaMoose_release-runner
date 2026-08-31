@@ -1,5 +1,6 @@
-name: 'Release Runner'
-description: 'Semantic release orchestration for TBD/BBD pipelines with Docker image promotion and promotion PR automation.'
+name: 'Diatreme'
+description: 'Multi-tool semantic release orchestration for GitHub.com and Enterprise: provenance-verified Docker promotion, CycloneDX SBOMs, and multi-ecosystem package publishing.'
+author: 'MagmaMoose'
 
 branding:
   icon: 'git-branch'
@@ -14,8 +15,9 @@ inputs:
   mode:
     description: |
       Pipeline mode. One of:
-        ci       Build Docker image and push pr-<N> to GHCR (run on pull_request events).
-        release  (default) Run versioning, promote Docker image, and optionally create a promotion PR (when deployment-model is tbd-pr and create-promotion-pr is true).
+        ci                 Build Docker image and push pr-<N> to GHCR (run on pull_request events).
+        release            (default) Run versioning, promote Docker image, and optionally create a promotion PR (when deployment-model is tbd-pr and create-promotion-pr is true).
+        enable-auto-merge  Enable native GitHub auto-merge on the PR referenced by `pr-number`. Intended for non-promotion (feature) PRs invoked from a separate `pull_request` workflow. The repository must have "Allow auto-merge" enabled and branch protection with at least one required status check on the target branch — both are GitHub prerequisites for auto-merge, not Diatreme ones.
     required: false
     default: 'release'
 
@@ -23,7 +25,7 @@ inputs:
   auth-mode:
     description: |
       Token source for git/release operations. One of:
-        public-app    (default) Use the Release Runner GitHub App installed on the repository or organization.
+        public-app    (default) Use the Diatreme GitHub App installed on the repository or organization.
         auto          Use private-app when app-id/app-private-key are set, otherwise use github-token/GITHUB_TOKEN.
         github-token  Use github-token or the workflow GITHUB_TOKEN.
         private-app   Generate a token from app-id/app-private-key.
@@ -32,26 +34,60 @@ inputs:
 
   token-broker-url:
     description: |
-      Advanced override for the hosted Release Runner GitHub App auth service.
+      Advanced override for the hosted Diatreme GitHub App auth service.
       Most repositories should not set this.
     required: false
-    default: 'https://release-runner.sargeant.workers.dev'
+    default: 'https://api.diatreme.magmamoose.com'
+
+  token-broker-fallback-url:
+    description: |
+      Secondary broker tried only when the primary is unreachable or returns 5xx.
+      A broker hostname losing egress blocks releases in every repository pinned to
+      every published version, and no shipped change can redirect those pins - so
+      the fallback has to travel with the action itself. Set to an empty string to
+      disable. Never used for 4xx: a rejected token is an answer, not an outage.
+    required: false
+    default: 'https://broker-diatreme.magmamoose.com'
 
   oidc-audience:
     description: 'Advanced override for public-app authentication. Most repositories should not set this.'
     required: false
-    default: 'release-runner'
+    default: 'diatreme'
 
   # ── Versioning tool ──────────────────────────────────────────────────────
   versioning-tool:
     description: |
       The versioning tool to use. One of:
-        semantic-release-python   python-semantic-release v10 (default)
+        auto                      (default) Detect the tool from repository
+                                  markers under `working-directory`. See the
+                                  detection rules below.
+        semantic-release-python   python-semantic-release v10
         semantic-release-npm      semantic-release v24 (Node.js / JavaScript)
         gitversion                GitVersion via gittools/actions
         release-please            Google release-please-action v4
+
+      Autodetection (versioning-tool: auto) inspects `working-directory` in
+      two tiers and errors if nothing matches or the signals conflict — set an
+      explicit tool to opt out.
+
+      Tier 1 — a tool's own release config (authoritative, one tool each):
+        semantic-release-python   pyproject.toml with a [tool.semantic_release] table
+        semantic-release-npm      .releaserc* / release.config.*
+        gitversion                GitVersion.yml|.yaml (or gitversion-config)
+        release-please            release-please-config.json /
+                                  .release-please-manifest.json (or
+                                  release-please-config-file)
+      Two or more distinct tier-1 tools is a conflict → error.
+
+      Tier 2 — ecosystem manifests (only when no tier-1 config is found):
+        semantic-release-python   pyproject.toml / setup.py / setup.cfg
+        semantic-release-npm      package.json
+        gitversion                *.csproj / *.sln
+      When several tier-2 manifests coexist, a fixed precedence
+      (python → npm → gitversion) breaks the tie so a Python service that also
+      carries a package.json still resolves to python.
     required: false
-    default: 'semantic-release-python'
+    default: 'auto'
 
   # ── Deployment model ─────────────────────────────────────────────────────
   deployment-model:
@@ -104,8 +140,8 @@ inputs:
   create-promotion-pr:
     description: |
       When true, automatically creates the next environment promotion PR after a
-      prerelease (deployment-model: tbd-pr only). Set to false when using the
-      tbd-promote reusable workflow separately.
+      prerelease (deployment-model: tbd-pr only). Set to false when using a
+      separate promotion workflow or manual process.
 
       One open promotion PR per target environment: if an open promotion PR
       already exists for the next environment (any version), its title and
@@ -170,7 +206,7 @@ inputs:
   submodules:
     description: |
       Pass-through to actions/checkout's `submodules` input on
-      release-runner's internal checkout step.
+      diatreme's internal checkout step.
 
       When set non-false in `auth-mode: private-app` or `auth-mode:
       auto` with App credentials, the App installation token is also
@@ -195,12 +231,34 @@ inputs:
     description: |
       Base image name without registry or owner prefix (e.g., my-app).
       Sets IMAGE_NAME=<owner>/<image_name> for the bake file.
-      Required for mode: ci. When set in mode: release, images are promoted after versioning.
+
+      Optional — when omitted, Diatreme auto-detects it from the Docker Bake
+      config (`bake_file` / `bake_target`): it runs `docker buildx bake
+      --print`, takes the first non-empty target tag, and strips the digest,
+      tag, registry, and owner/org prefix down to the base name. An explicit
+      value always wins over detection.
+
+      Detection drives the same image workflows an explicit value does — the
+      CI image build (mode: ci), the image scan (image-scan), and release
+      image promotion (mode: release). So mode: ci and BBD release promotion
+      work without passing image_name as long as the bake file has tagged
+      targets. With no bake file present and no explicit value, image_name is
+      left empty and image workflows are skipped (versioning-only runs are
+      unaffected). A bake file that exists but yields no tags is a hard error —
+      Diatreme never falls back to the repository name.
+
+      To keep a tagged bake file but run versioning only, set
+      `detect-image-name: false` to opt out of detection entirely.
     required: false
     default: ''
 
   bake_file:
-    description: 'Path to docker-bake.hcl'
+    description: |
+      Path to the Docker Bake file. When it (or `docker-bake.json`, when this is
+      left at the default) exists, Diatreme builds with `docker buildx bake`.
+      When NO bake file is present but a `dockerfile` exists, Diatreme falls back
+      to building it directly with `docker buildx build` (and emits a warning
+      nudging you toward a bake file). See the `dockerfile` input.
     required: false
     default: 'docker-bake.hcl'
 
@@ -210,6 +268,36 @@ inputs:
       Groups are expanded — all sub-targets are built/promoted automatically.
     required: false
     default: 'default'
+
+  dockerfile:
+    description: |
+      Path to the Dockerfile used by the no-bake fallback. When no Docker Bake
+      file is present (see `bake_file`) but this file exists, Diatreme builds the
+      image directly with `docker buildx build -f <dockerfile> .` — honouring the
+      same `platforms`, tags, provenance labels, GHA cache, `build-github-token`
+      secret, and `--push` semantics as the bake path.
+
+      This makes the simplest consumer (one Dockerfile, no bake file) Just Work.
+      Prefer a `docker-bake.hcl` when you need multi-target builds, tag
+      templating, multi-arch defaults, or local↔CI build parity — Diatreme emits
+      a warning on the fallback path to point you there.
+    required: false
+    default: 'Dockerfile'
+
+  detect-image-name:
+    description: |
+      When true (default) and `image_name` is empty, auto-detect the base image
+      name from the Docker Bake config (see `image_name`). Set to false to opt
+      out of detection: `image_name` then behaves as it did before this feature
+      — an empty value leaves image workflows off.
+
+      This is the escape hatch for a repo that keeps a tagged `docker-bake.hcl`
+      but runs Diatreme for versioning only (no image build/promotion) and so
+      does not want a bare `mode: ci`/`release` run to start building or
+      promoting images. An explicit `image_name` always wins regardless of this
+      flag.
+    required: false
+    default: 'true'
 
   registry:
     description: 'Container registry'
@@ -251,9 +339,15 @@ inputs:
     default: ''
 
   platforms:
-    description: 'Target platforms (comma-separated) for CI builds and fallback fresh builds.'
+    description: >-
+      Target platforms (comma-separated), e.g. "linux/amd64,linux/arm64".
+      Empty (the default) DEFERS to the repo's docker-bake.hcl — its own
+      `variable "PLATFORMS"` default / target `platforms` decides. Set this
+      only to force platforms regardless of the bake file. (Previously this
+      defaulted to linux/amd64 and was exported unconditionally, silently
+      overriding a repo's multi-arch bake default → amd64-only images.)
     required: false
-    default: 'linux/amd64'
+    default: ''
 
   build-github-token:
     description: |
@@ -264,14 +358,380 @@ inputs:
     required: false
     default: ''
 
+  image-skip-existing:
+    description: |
+      Skip re-publishing an image whose release tag ALREADY POINTS AT the exact
+      manifest this run was about to publish. Lets a partially-failed
+      multi-target promote resume without redoing the targets that landed, and
+      makes a re-run of a completed promote a no-op.
+
+      The test is identity, not existence. A tag is a mutable pointer that any
+      holder of `packages: write` on the registry can create, so "a tag with
+      that name is there" is no evidence this pipeline put it there — skipping
+      on that alone would let an image Diatreme never built be released, signed
+      and attested. The gate therefore compares manifest digests, runs only
+      AFTER the provenance check on the promote source, and on a stable release
+      additionally requires `:latest` to resolve to the same digest (otherwise
+      an interrupted promote that wrote the version tag but not `:latest` would
+      be recorded as done while `:latest` still served the previous release).
+
+      Anything unproven — a registry error, an unreadable manifest, a digest
+      that differs — falls through and does the work.
+
+      It cannot short-circuit the fresh-build fallback: a rebuild's digest is
+      not knowable in advance, so a release whose source image failed
+      provenance verification is rebuilt on every run. That is a real limit of
+      the gate, not an oversight.
+
+      Off by default: re-cutting the same version deliberately (a force-pushed
+      tag) must still republish.
+    required: false
+    default: 'false'
+
+  # ── Image scanning & SBOM (mode: ci) ──────────────────────────────────────
+  # Scan the assembled pr-<N> image and route results to their sinks: a
+  # CycloneDX SBOM to Dependency-Track (component CVEs), and optional findings
+  # to DefectDojo (OS CVEs, misconfigurations, secrets in layers). Reporting is
+  # visibility-first — a successful scan never blocks the PR unless
+  # `image-scan-gate` is on. A scanner that cannot run is a build error.
+  image-scan:
+    description: |
+      Scan the assembled pr-<N> image after build (mode: ci) and emit its
+      SBOM + findings. Off by default. Requires `image_name`.
+    required: false
+    default: 'false'
+
+  image-scan-severity:
+    description: |
+      Trivy `--severity` filter for findings and the optional gate
+      (comma-separated). The CycloneDX SBOM still inventories all components.
+    required: false
+    default: 'CRITICAL,HIGH'
+
+  image-scan-scanners:
+    description: |
+      Trivy `--scanners` to run for the findings report. Default covers OS/lib
+      CVEs, secrets baked into layers, and image misconfigurations.
+    required: false
+    default: 'vuln,secret,misconfig'
+
+  image-scan-gate:
+    description: |
+      Block the build when findings at/above `image-scan-severity` exist.
+      Default false (non-blocking, visibility only) — start here and tighten
+      later. This is a blunt severity threshold; net-new diffing against the
+      base image is the intended direction.
+    required: false
+    default: 'false'
+
+  image-scan-strict:
+    description: |
+      Treat a *sink* failure (Dependency-Track / DefectDojo unreachable or
+      rejecting) as fatal instead of a non-blocking warning. Default false —
+      reporting backends stay failure-isolated, so an outage never fails the PR.
+    required: false
+    default: 'false'
+
+  image-sign:
+    description: |
+      Sign the released image(s) with cosign (keyless / Sigstore) and attach SLSA
+      build provenance (GitHub Artifact Attestations), by IMMUTABLE DIGEST, in
+      `mode: release` after promotion/build. Off by default. Requires
+      `id-token: write`, `attestations: write`, and `packages: write` on the job.
+      Verify with `cosign verify …` and `gh attestation verify oci://… --owner <org>`.
+    required: false
+    default: 'false'
+
+  dependency-track-url:
+    description: |
+      Dependency-Track base URL (e.g. https://dtrack.example.com). When set,
+      the image's CycloneDX SBOM is uploaded as the assembled-image project —
+      distinct from any source-dependency SBOM project for the same repo.
+      Empty disables the sink. Outages are non-blocking.
+    required: false
+    default: ''
+
+  dependency-track-api-key:
+    description: 'Dependency-Track API key with BOM upload permission. Pass a workflow secret.'
+    required: false
+    default: ''
+
+  dependency-track-project-name:
+    description: |
+      Dependency-Track project name. Defaults to the image repository path
+      (e.g. owner/app). With multiple bake targets, the image leaf name is
+      appended to keep the projects distinct.
+    required: false
+    default: ''
+
+  dependency-track-project-version:
+    description: 'Dependency-Track project version. Defaults to the image tag (e.g. pr-12).'
+    required: false
+    default: ''
+
+  dependency-track-auto-create:
+    description: |
+      Create the Dependency-Track project/version on first upload. Default true
+      (the API key then needs PROJECT_CREATION_UPLOAD in addition to BOM_UPLOAD).
+    required: false
+    default: 'true'
+
+  defectdojo-url:
+    description: |
+      DefectDojo base URL (e.g. https://dd.example.com). When set, the Trivy
+      findings report is imported. Empty disables the sink. Outages are
+      non-blocking. Optional — the SBOM → Dependency-Track feed already yields
+      component CVEs; this adds OS CVEs / misconfigs / secrets.
+    required: false
+    default: ''
+
+  defectdojo-api-key:
+    description: 'DefectDojo API v2 token. Pass a workflow secret.'
+    required: false
+    default: ''
+
+  defectdojo-engagement:
+    description: |
+      DefectDojo engagement id to import into. If empty, set
+      `defectdojo-product-name` to import via auto-created context instead.
+      If both are empty while `defectdojo-url` is set, the import is skipped
+      with a warning (non-blocking).
+    required: false
+    default: ''
+
+  defectdojo-product-name:
+    description: |
+      DefectDojo product name for the auto-create-context import path (used
+      when `defectdojo-engagement` is empty).
+    required: false
+    default: ''
+
+  defectdojo-product-type:
+    description: 'DefectDojo product type for the auto-create-context path (optional).'
+    required: false
+    default: ''
+
+  defectdojo-engagement-name:
+    description: 'DefectDojo engagement name for the auto-create-context path. Default "Diatreme image scan".'
+    required: false
+    default: ''
+
+  defectdojo-close-old:
+    description: |
+      Close findings that are no longer present, on reimport. Default true.
+      Diatreme imports via DefectDojo's reimport-scan so one Test per engagement
+      is updated across PR re-runs (mirrors Chargate).
+    required: false
+    default: 'true'
+
+  # ── Package publishing ────────────────────────────────────────────────────
+  # Native library-package publishing, in addition to (or instead of) Docker
+  # image promotion. Opt-in via `publish-package: true`; gated on the same
+  # `released` signal and environment logic as versioning/tagging, so each run
+  # publishes the version diatreme just computed for its environment —
+  # prereleases on dev/staging, stable on prod (the prerelease state is
+  # encoded in the version string itself, e.g. 1.2.3-rc.1).
+  publish-package:
+    description: |
+      When true, pack and push a language package to `package-feed-url` after
+      versioning, using the version diatreme computed (the `version` output).
+      Off by default so existing image-promotion / versioning-only consumers
+      are unaffected. Runs only when a new version was released
+      (`released == true`), after Docker image promotion and before the
+      GitHub Release is published — so a `release:published` listener finds
+      the package already in the feed (same ordering rationale as images).
+    required: false
+    default: 'false'
+
+  package-ecosystem:
+    description: |
+      Package ecosystem to publish when `publish-package` is true. One of:
+        nuget     .NET — `dotnet pack` + `dotnet nuget push`.
+        npm       Node.js — `npm publish`.
+        maven     JVM — `mvn versions:set` + `mvn deploy`.
+        gradle    JVM — `gradle publish` (project's maven-publish block).
+        rubygems  Ruby — `gem build` + `gem push`.
+        container OCI image — `docker build` + `docker push` (ghcr.io).
+        pip       Python — `python -m build` + `twine upload` (PyPI / any
+                  index; not a GitHub Packages ecosystem, kept for convenience).
+      All but pip are GitHub Packages ecosystems and default to this repo's
+      GitHub Packages feed. Required when `publish-package` is true.
+    required: false
+    default: ''
+
+  # ── S3 artifact publishing ────────────────────────────────────────────────
+  # `package-ecosystem: s3` publishes an ALREADY-BUILT artifact to an object store under a
+  # version-scoped, immutable key — a Lambda zip, a signed binary, a firmware image. There is
+  # no pack step, because inventing one per artifact type is how this stops being reusable.
+  #
+  # Auth is OIDC only. Add `aws-actions/configure-aws-credentials` before this action with the
+  # same role, and give the job `id-token: write`; no AWS key is stored anywhere.
+  aws-role-to-assume:
+    description: >
+      IAM role ARN the caller's OIDC step assumed, for `package-ecosystem: s3`. Required for
+      that ecosystem. Only VERIFIED here (via `sts get-caller-identity`), so a workflow that
+      forgot the credentials step fails with an actionable message rather than a 403 on upload.
+
+      The role's trust policy is what decides who may publish — bind it to one repository and
+      to its default branch plus tags, or every GitHub Actions workflow on github.com can
+      assume it.
+    required: false
+    default: ''
+
+  package-path:
+    description: |
+      Project or path to pack/build/publish. Defaults to `working-directory`.
+        nuget     A .csproj/.sln/.nupkg path or a directory.
+        npm       The package directory (or a package.json path).
+        maven     The project dir or its pom.xml.
+        gradle    The project dir (or a build.gradle(.kts) path).
+        rubygems  The dir containing the .gemspec.
+        container The Docker build context (must contain a Dockerfile).
+        pip       The source dir containing pyproject.toml/setup.py.
+    required: false
+    default: ''
+
+  package-feed-url:
+    description: |
+      Upload / publish endpoint. Accepts a public GitHub Packages host, a
+      canonical public registry (npmjs / nuget.org / rubygems.org / Maven
+      Central / PyPI) for public distribution, or a GitHub Enterprise host —
+      Enterprise Server `<ecosystem>.HOSTNAME` or data-residency
+      `<ecosystem>.SUBDOMAIN.ghe.com`. The auth model is unchanged; only the
+      host differs. Empty defaults per-ecosystem (the repo's GitHub Packages
+      feed, except npm/pip which default to the public registry):
+        nuget     NuGet v3 index. Default https://nuget.pkg.github.com/<owner>/index.json.
+        npm       npm registry. Default https://registry.npmjs.org (public).
+        maven     Maven repo URL. Default https://maven.pkg.github.com/<owner>/<repo>.
+        gradle    Informational only — the repository is defined in build.gradle.
+        rubygems  Gem host. Default https://rubygems.pkg.github.com/<owner>.
+        container Image registry host. Default ghcr.io; set this to publish to
+                  another registry, e.g. an enterprise containers.HOSTNAME.
+        pip       twine repository URL (--repository-url). Empty publishes to PyPI.
+      Note: the GitHub Packages Apache Maven registry is not available on
+      data-residency (*.ghe.com) tenants — use your enterprise Maven host there.
+    required: false
+    default: ''
+
+  package-token:
+    description: |
+      Auth token / API key for the package feed. Defaults to the workflow
+      GITHUB_TOKEN (the `github-token` input, or `github.token`), which is
+      what GitHub Packages feeds expect with `packages: write`. This is the
+      registry-login token, independent of the git/release auth token — pass
+      a workflow secret (e.g. secrets.NUGET_FEED_TOKEN) when targeting a feed
+      that requires fixed credentials, such as a GitHub Enterprise Packages
+      feed on another host.
+    required: false
+    default: ''
+
+  package-username:
+    description: |
+      Feed / registry-login username. Defaults to `__token__` for `pip` (twine)
+      and `x-access-token` for `maven`/`gradle`/`rubygems`/`container`. Ignored
+      by `nuget` and `npm`, which authenticate with the token alone.
+    required: false
+    default: ''
+
+  dotnet-version:
+    description: |
+      .NET SDK version range for `package-ecosystem: nuget`, passed to
+      actions/setup-dotnet. Override to match the project's target framework
+      (e.g. 9.0.x). Multiple versions can be newline-separated.
+    required: false
+    default: '8.0.x'
+
+  python-version:
+    description: |
+      Python version for `package-ecosystem: pip`, passed to
+      actions/setup-python.
+    required: false
+    default: '3.x'
+
+  node-version:
+    description: |
+      Node.js version for `package-ecosystem: npm`, passed to
+      actions/setup-node.
+    required: false
+    default: '20'
+
+  java-version:
+    description: |
+      Java (JDK) version for `package-ecosystem: maven` / `gradle`, passed to
+      actions/setup-java.
+    required: false
+    default: '17'
+
+  java-distribution:
+    description: |
+      JDK distribution for `package-ecosystem: maven` / `gradle`, passed to
+      actions/setup-java (e.g. temurin, zulu, corretto).
+    required: false
+    default: 'temurin'
+
+  ruby-version:
+    description: |
+      Ruby version for `package-ecosystem: rubygems`, passed to ruby/setup-ruby.
+    required: false
+    default: '3.3'
+
+  package-name:
+    description: |
+      Image name for `package-ecosystem: container`, published as
+      `<package-feed-url|ghcr.io>/<package-name>:<version>`. Defaults to the
+      repository (owner/repo) lowercased. Ignored by the other ecosystems,
+      which take their name from the project manifest.
+    required: false
+    default: ''
+
+  npm-provenance:
+    description: |
+      When true, publish npm packages with build provenance
+      (`npm publish --provenance`). Valid only for the public npm registry
+      (registry.npmjs.org) — the run fails if package-feed-url points elsewhere,
+      since GitHub Packages and other registries don't accept npmjs provenance
+      attestations. Requires `id-token: write` on the job (the default
+      `auth-mode: public-app` already grants it) and a public `repository`
+      field in package.json matching the publishing repo. Ignored unless
+      package-ecosystem is npm.
+    required: false
+    default: 'false'
+
+  pypi-trusted-publishing:
+    description: |
+      When true, authenticate pip/twine uploads via GitHub OIDC (PyPI Trusted
+      Publishing) instead of package-token — no stored token. Valid only for
+      public PyPI / TestPyPI; the run fails for any other index (private indexes
+      keep using package-token). Requires `id-token: write` on the job (the
+      default `auth-mode: public-app` already grants it) and a Trusted Publisher
+      configured for this repo+workflow on the PyPI project. Ignored unless
+      package-ecosystem is pip.
+    required: false
+    default: 'false'
+
   # ── CI-specific ──────────────────────────────────────────────────────────
   enforce_branch_naming:
     description: |
       Enforce TBD branch naming convention on PRs (mode: ci).
-      Allowed prefixes: feat, fix, chore, hotfix, docs, refactor, perf, test, ci, style.
+      Allowed prefixes: feat, fix, chore, hotfix, docs, refactor, perf, test,
+      ci, style, build, revert, deploy, release (plus the promote prefix). Add
+      more via extra-branch-prefixes.
       Set to false for BBD (branches are named after environments).
     required: false
     default: 'true'
+
+  extra-branch-prefixes:
+    description: |
+      Additional branch-name prefixes to accept beyond the built-in set
+      (mode: ci, enforce_branch_naming: true). Comma-, space-, or
+      pipe-separated. Example: 'spike wip' accepts spike/* and wip/* branches.
+
+      Each prefix must be letters, digits, '_' or '-' (a trailing '/' is
+      allowed and ignored). Anything else is rejected: the prefixes are
+      matched as a regex, where a metacharacter would silently widen or
+      break the check rather than add a prefix.
+    required: false
+    default: ''
 
   # ── Integrations: GitHub Projects ─────────────────────────────────────────
   aggregate-github-projects:
@@ -292,7 +752,7 @@ inputs:
         - Repository: Pull requests: Write (to edit promotion PR bodies)
         - Organization or User: Projects: Read
 
-      With auth-mode: public-app, the default Release Runner App ships
+      With auth-mode: public-app, the default Diatreme App ships
       with only the permissions needed for tagging and Releases. Issues,
       Pull requests, and Projects must be granted on the App settings
       AND re-accepted on each installation; otherwise the GraphQL probe
@@ -379,8 +839,40 @@ inputs:
         ''        → no guardrail
 
       The auth token must allow Repository: Administration: Read. With
-      auth-mode: public-app, grant the permission on the Release Runner App
+      auth-mode: public-app, grant the permission on the Diatreme App
       and accept it on the installation.
+    required: false
+    default: '@last'
+
+  allowed-release-actors:
+    description: |
+      Restrict who may cut a release at or after `allowed-release-actors-from`.
+      Comma-separated GitHub logins, and/or teams as `@org/team-slug` (or
+      `@team-slug`, which resolves against this repository's owner). A JSON
+      array is also accepted. Matching is case-insensitive.
+
+      Empty (the default) leaves releases unrestricted — the gate is inert
+      until you populate it.
+
+      Unlike `admin-required-from` this applies on every trigger, not only
+      `workflow_dispatch`, and it names people rather than asking for the much
+      broader repo-admin grant. The two are independent; both are enforced when
+      both are set.
+
+      Include any bot login that merges promotion PRs on your behalf, or the
+      release those merges trigger will be refused.
+
+      Team lookups need the token to be able to read org team membership.
+      Listing only plain logins needs no extra permission. A membership lookup
+      that cannot be completed denies the release rather than allowing it.
+    required: false
+    default: ''
+
+  allowed-release-actors-from:
+    description: |
+      First environment (by position in `environments`) at which
+      `allowed-release-actors` is enforced. `@last` resolves to the final
+      entry, i.e. production only. Same semantics as `admin-required-from`.
     required: false
     default: '@last'
 
@@ -420,13 +912,22 @@ inputs:
 
       Honoured by:
         - semantic-release-python: passed as the upstream `force` input.
+        - semantic-release-npm: commit-message gating is skipped and the
+          next version is derived by bumping the latest stable tag at the
+          requested level. On prerelease branches this cuts the next
+          `<version>-<identifier>.N` tag; on stable branches the tag is
+          created directly and semantic-release itself is skipped, so
+          config-driven publish plugins (changelog commit, npm publish,
+          ...) do not run for that release — the GitHub Release still
+          comes from the deferred publish step. Promotion PRs ignore it
+          (their version always comes from the promoted tag).
         - gitversion: passed to gittools/actions@v4 as
           `overrideConfig: increment=Major|Minor|Patch`.
 
-      Ignored by semantic-release-npm and release-please — those tools
-      have no clean equivalent and a forced bump would conflict with the
-      tool's own logic. Wire your `workflow_dispatch` `bump` input to
-      this input from the caller workflow.
+      Ignored by release-please — it has no clean equivalent and a
+      forced bump would conflict with the tool's own logic. Wire your
+      `workflow_dispatch` `bump` input to this input from the caller
+      workflow.
     required: false
     default: ''
 
@@ -435,7 +936,7 @@ inputs:
       Explicit version to release/build. Accepts SemVer with optional `v`
       prefix, e.g. `3.20.0` or `v3.20.0-rc.1`.
 
-      When set, release-runner skips automatic version calculation and uses
+      When set, diatreme skips automatic version calculation and uses
       this value for release tag/image versioning. The optional `v` prefix is
       stripped only for `${VERSION}` substitution in bake/build args.
 
@@ -446,18 +947,30 @@ inputs:
   # ── Version file injection (any tool) ─────────────────────────────────────
   version-file:
     description: |
-      Path to a JSON file where the released version is injected and committed
-      back to the branch after every release. Works with every versioning
-      tool, not just GitVersion. Typical use: persist the version into
-      `appsettings.json` for a .NET app so the running container can display
-      its own version.
+      Path to a JSON or YAML file where the released version is injected and
+      committed back to the branch after every release. Works with every
+      versioning tool, not just GitVersion. Typical uses:
+      - JSON: persist the version into `appsettings.json` for a .NET app.
+      - YAML: update `appVersion` in a Helm `Chart.yaml` so the chart tracks
+        the released image tag automatically.
 
-      JSON only — the injection step uses `jq`. YAML targets (e.g. Helm
-      `Chart.yaml`) aren't supported today; if `jq` errors on the file
-      the step warns and skips so a mis-configured file does not block
-      the release.
+      Accepts one path, or several: separate them with newlines (preferred) or
+      commas. Each entry may be a glob — `*` and `**` are expanded against the
+      workspace — so a monorepo can sync every workspace manifest in one entry:
 
-      The commit uses the resolved release auth token (Release Runner App,
+        version-file: |
+          package.json
+          packages/*/package.json
+
+      All matched files are updated and committed together. A path that does
+      not exist, a glob that matches nothing, or a file the path expression
+      cannot be applied to is warned about and skipped; it never fails the
+      release.
+
+      File format is detected from the extension: `.yaml`/`.yml` files are
+      processed with `yq`; all other files are processed with `jq`.
+
+      The commit uses the resolved release auth token (Diatreme App,
       private app, or `github-token`), so it can bypass branch-protection
       rulesets when the App is in the bypass list. The commit message ends
       with `[skip ci]` so the push does not retrigger the release workflow.
@@ -469,10 +982,23 @@ inputs:
 
   version-file-json-path:
     description: |
-      jq path for the version field inside `version-file`. Only used when
-      `version-file` is set. Example: `.Application.Version`
+      jq path for the version field inside `version-file` when the file is
+      JSON. Only used when `version-file` is set and the file is not a
+      `.yaml`/`.yml` file. Example: `.Application.Version`
     required: false
     default: '.Application.Version'
+
+  version-file-yaml-path:
+    description: |
+      yq path for the version field inside `version-file` when the file is
+      YAML (`.yaml` or `.yml` extension). Only used when `version-file` is
+      set and the file has a YAML extension. Example: `.appVersion`
+
+      For Helm charts, set this to `.appVersion` (default) to update the
+      application version, or `.version` to update the chart version, or a
+      custom path for other YAML schemas.
+    required: false
+    default: '.appVersion'
   # ── Integrations ──────────────────────────────────────────────────────────
   aggregate-clickup-tickets:
     description: |
@@ -483,7 +1009,7 @@ inputs:
       the auto-opened promotion PR body when one exists.
 
       The auth token must allow editing release notes and PR bodies. With
-      auth-mode: public-app this is already covered by the Release Runner App.
+      auth-mode: public-app this is already covered by the Diatreme App.
     required: false
     default: 'false'
 
@@ -494,9 +1020,20 @@ inputs:
     default: '6.x'
 
   gitversion-config:
-    description: 'Path to GitVersion.yml. Only used when versioning-tool is gitversion.'
+    description: |
+      Path to a GitVersion config file. Only used when the resolved versioning
+      tool is gitversion.
+
+      Empty (the default) means Diatreme looks for a `GitVersion.yml` or
+      `GitVersion.yaml` under `working-directory` and hands that to GitVersion,
+      or lets GitVersion run on its built-in defaults when neither exists. Set
+      this only to point at a config kept somewhere else — an explicit path
+      that does not exist is an error.
+
+      A relative path is resolved against `working-directory`, matching how
+      autodetection scopes its markers. An absolute path is used as-is.
     required: false
-    default: 'GitVersion.yml'
+    default: ''
 
   gitversion-appsettings-file:
     description: |
@@ -523,6 +1060,25 @@ inputs:
     required: false
     default: 'release-please-config.json'
 
+  # ── enable-auto-merge mode ────────────────────────────────────────────────
+  pr-number:
+    description: |
+      Pull request number to operate on. Required for `mode: enable-auto-merge`.
+      Typically passed as `github.event.pull_request.number` from a
+      `pull_request` workflow (wrapped in the usual expression syntax in
+      the caller's `with:` block).
+    required: false
+    default: ''
+
+  auto-merge-method:
+    description: |
+      Merge method used by `mode: enable-auto-merge`. One of:
+        squash  (default) Squash the PR's commits into a single commit on the target branch.
+        merge   Standard merge commit.
+        rebase  Rebase the PR's commits onto the target branch.
+    required: false
+    default: 'squash'
+
 # ─────────────────────────────────────────────────────────────────────────────
 # OUTPUTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -545,6 +1101,37 @@ outputs:
   resolved-environment:
     description: 'The resolved environment name.'
     value: ${{ steps.detect-env.outputs.environment }}
+  package-published:
+    description: '"true" if a language package was packed and pushed to the configured feed.'
+    value: ${{ steps.publish-package.outputs.published }}
+  image-scanned:
+    description: '"true" if the assembled pr-<N> image(s) were scanned (mode: ci with image-scan).'
+    value: ${{ steps.scan-image.outputs.scanned }}
+  image-findings:
+    description: 'Count of image-scan findings at/above image-scan-severity across all scanned images.'
+    value: ${{ steps.scan-image.outputs.image-findings }}
+  image-signed:
+    description: 'Number of released image(s) cosign-signed (mode: release with image-sign).'
+    value: ${{ steps.sign-image.outputs.signed_count }}
+  resolved-image-name:
+    description: |
+      The base image name Diatreme used for image workflows — the explicit
+      `image_name` input when set, the value auto-detected from the Docker Bake
+      config, or the repository name on the no-bake Dockerfile path. Empty when
+      none applies (versioning-only runs).
+    value: ${{ steps.resolve-image.outputs.image_name }}
+  images-promoted:
+    description: 'Number of release image(s) retagged from a provenance-verified source image.'
+    value: ${{ steps.promote-images.outputs.promoted_count }}
+  images-skipped:
+    description: 'Number of release image(s) already present in the registry and skipped via image-skip-existing.'
+    value: ${{ steps.promote-images.outputs.skipped_count }}
+  images-rebuilt:
+    description: 'Number of release image(s) built fresh because provenance was unverified or the retag failed.'
+    value: ${{ steps.promote-images.outputs.rebuilt_count }}
+  version-files-updated:
+    description: 'Number of tracked files the released version was injected into and committed.'
+    value: ${{ steps.version-file-inject.outputs.updated_count }}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEPS
@@ -574,7 +1161,7 @@ runs:
           inputs.app-id != '' &&
           inputs.app-private-key != ''
         )
-      uses: actions/create-github-app-token@v3
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
       with:
         app-id: ${{ inputs.app-id }}
         private-key: ${{ inputs.app-private-key }}
@@ -586,10 +1173,11 @@ runs:
 
     - name: Request public GitHub App token
       id: public-app-token
-      if: inputs.mode == 'release' && inputs.auth-mode == 'public-app'
+      if: (inputs.mode == 'release' || inputs.mode == 'enable-auto-merge') && inputs.auth-mode == 'public-app'
       shell: bash
       env:
         TOKEN_BROKER_URL: ${{ inputs.token-broker-url }}
+        TOKEN_BROKER_FALLBACK_URL: ${{ inputs.token-broker-fallback-url }}
         OIDC_AUDIENCE: ${{ inputs.oidc-audience }}
       run: "${GITHUB_ACTION_PATH}/scripts/request-public-app-token.sh"
 
@@ -606,12 +1194,37 @@ runs:
 
     # ── 2. Checkout ─────────────────────────────────────────────────────────
     - name: Checkout
-      uses: actions/checkout@v6
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
         fetch-depth: 0
         fetch-tags: true
         token: ${{ steps.auth.outputs.token }}
         submodules: ${{ inputs.submodules }}
+
+    # ── 3. Resolve image name (ci + release) ─────────────────────────────────
+    # image_name is optional. When the caller omits it, derive the base image
+    # name from the repo's Docker Bake config — the same way the environment is
+    # inferred from the deployment model — so no caller needs a bespoke
+    # pre-step just to compute it. An explicit image_name always wins. Every
+    # downstream image step (CI build, image scan, release promotion) gates on
+    # and reads this resolved value, so detection and explicit input drive the
+    # identical path. Runs after Checkout so the bake file is on disk.
+    - name: Resolve image name
+      id: resolve-image
+      if: inputs.mode == 'ci' || inputs.mode == 'release'
+      shell: bash
+      env:
+        INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+        DETECT_IMAGE_NAME: ${{ inputs.detect-image-name }}
+        INPUT_BAKE_FILE: ${{ inputs.bake_file }}
+        INPUT_BAKE_TARGET: ${{ inputs.bake_target }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        INPUT_REPO_FULL: ${{ github.repository }}
+        # Inherited by `bake --print` so the printed target set matches the
+        # build/promote steps (only matters if the bake file gates targets on
+        # this secret).
+        BAKE_GITHUB_TOKEN: ${{ inputs.build-github-token }}
+      run: "${GITHUB_ACTION_PATH}/scripts/resolve-image-name.sh"
 
     # ═════════════════════════════════════════════════════════════════════════
     # CI MODE — build and push pr-<N> image
@@ -622,6 +1235,7 @@ runs:
       shell: bash
       env:
         PROMOTE_BRANCH_PREFIX: ${{ inputs.promote-branch-prefix }}
+        EXTRA_BRANCH_PREFIXES: ${{ inputs.extra-branch-prefixes }}
       run: "${GITHUB_ACTION_PATH}/scripts/check-branch-naming.sh"
 
     - name: Validate version override
@@ -658,34 +1272,47 @@ runs:
         echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
 
     - name: Set up QEMU
-      if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
+      uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
     - name: Set up Docker Buildx (CI)
-      if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
+      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      with:
+        # Self-hosted docker-in-docker runners (e.g. a k3s cluster) have a reduced
+        # pod-network MTU (flannel VXLAN ~1450), but buildkit's default CNI bridge for
+        # RUN steps is 1500 — so apt/npm/curl in a Dockerfile RUN blackhole large packets
+        # (TLS handshakes, package downloads) and hang until timeout. Run buildkit and its
+        # RUN sandboxes on the runner's host network instead of the 1500 CNI bridge, so
+        # they inherit the correct MTU. No-op on GitHub-hosted runners (normal MTU); the
+        # trade-off is RUN steps share the runner's netns, fine for trusted CI image builds.
+        driver-opts: network=host
+        buildkitd-flags: --oci-worker-net=host
 
     - name: Log in to container registry (CI)
-      if: inputs.mode == 'ci' && inputs.image_name != ''
-      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ${{ inputs.registry }}
         username: ${{ inputs.registry-username || github.actor }}
         password: ${{ inputs.registry-password || steps.auth.outputs.registry-token }}
 
     - name: Build and push pr-<N>
-      if: inputs.mode == 'ci' && inputs.image_name != ''
+      id: build-pr-image
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
       shell: bash
       env:
         VERSION: ${{ inputs.version-override != '' && steps.version-override.outputs.version || format('pr-{0}', github.event.pull_request.number) }}
         REGISTRY: ${{ inputs.registry }}
-        PLATFORMS: ${{ inputs.platforms }}
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
         BAKE_GITHUB_TOKEN: ${{ inputs.build-github-token }}
         OWNER: ${{ github.repository_owner }}
         REF_NAME: ${{ github.ref_name }}
-        INPUT_IMAGE_NAME: ${{ inputs.image_name }}
-        INPUT_BAKE_FILE: ${{ inputs.bake_file }}
+        INPUT_IMAGE_NAME: ${{ steps.resolve-image.outputs.image_name }}
+        STRATEGY: ${{ steps.resolve-image.outputs.strategy }}
+        INPUT_BAKE_FILE: ${{ steps.resolve-image.outputs.bake_file }}
         INPUT_BAKE_TARGET: ${{ inputs.bake_target }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
       run: |
         set -euo pipefail
 
@@ -694,6 +1321,40 @@ runs:
 
         echo "IMAGE_NAME: ${IMAGE_NAME}"
         echo "VERSION:    ${VERSION}"
+
+        # Stamp build provenance so `mode: release` can prove a pr-<N> image was
+        # built from the code it is about to release before promoting it
+        # (scripts/verify-promote-source.sh). The tree hash survives squash/rebase
+        # merges; the revision is the standard OCI label.
+        BUILD_REVISION=$(git rev-parse HEAD)
+        BUILD_TREE=$(git rev-parse 'HEAD^{tree}')
+
+        if [ "${STRATEGY}" = "dockerfile" ]; then
+          # No bake file — build the Dockerfile directly. Same knobs as the bake
+          # path: platforms, the pr-<N> tag, provenance labels, GHA cache, the
+          # github_token secret, --push.
+          export BUILD_GITHUB_TOKEN="${BAKE_GITHUB_TOKEN}"
+          export TAGS="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          export DOCKERFILE="${INPUT_DOCKERFILE}"
+          export PLATFORMS="${INPUT_PLATFORMS}"
+          export CACHE_SCOPE="bk-dockerfile-${REF_NAME}"
+          LABELS="$(printf 'org.opencontainers.image.revision=%s\ncom.magmamoose.diatreme.git-tree=%s' "${BUILD_REVISION}" "${BUILD_TREE}")"
+          export LABELS
+          "${GITHUB_ACTION_PATH}/scripts/build-image-dockerfile.sh"
+          exit 0
+        fi
+
+        if [ "${STRATEGY}" != "bake" ]; then
+          echo "::error::image_name is set ('${IMAGE_NAME}') but no Docker Bake file ('${INPUT_BAKE_FILE}') and no Dockerfile ('${INPUT_DOCKERFILE}') were found — nothing to build. Add a docker-bake.hcl or a Dockerfile, or leave image_name empty for a versioning-only run."
+          exit 1
+        fi
+
+        # Override the bake file's platforms ONLY when the caller set `platforms`
+        # explicitly. Empty (the default) leaves $PLATFORMS unset so the repo's
+        # docker-bake.hcl `variable "PLATFORMS"` default decides. NB: don't `export
+        # PLATFORMS=""` — bake treats an empty value as set and `split(",", "")`
+        # yields [""], an invalid platform. Unset is what defers to the default.
+        if [ -n "${INPUT_PLATFORMS}" ]; then export PLATFORMS="${INPUT_PLATFORMS}"; fi
 
         TARGETS=$(docker buildx bake \
           -f "${INPUT_BAKE_FILE}" "${INPUT_BAKE_TARGET}" \
@@ -706,11 +1367,84 @@ runs:
           CACHE_ARGS+=(--set "${TARGET}.cache-to=type=gha,mode=max,scope=${SCOPE}")
         done
 
+        # `--set` overrides only these two provenance keys in the consumer's
+        # bake file.
         docker buildx bake \
           -f "${INPUT_BAKE_FILE}" \
           "${INPUT_BAKE_TARGET}" \
           "${CACHE_ARGS[@]}" \
+          --set "*.labels.org.opencontainers.image.revision=${BUILD_REVISION}" \
+          --set "*.labels.com.magmamoose.diatreme.git-tree=${BUILD_TREE}" \
           --push
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CI MODE — scan the assembled image, emit SBOM + findings
+    # ─────────────────────────────────────────────────────────────────────────
+    - name: Install Trivy
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != '' && inputs.image-scan == 'true'
+      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+      with:
+        cache: true
+
+    - name: Scan image and report
+      id: scan-image
+      if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != '' && inputs.image-scan == 'true'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version-override != '' && steps.version-override.outputs.version || format('pr-{0}', github.event.pull_request.number) }}
+        OWNER: ${{ github.repository_owner }}
+        INPUT_IMAGE_NAME: ${{ steps.resolve-image.outputs.image_name }}
+        STRATEGY: ${{ steps.resolve-image.outputs.strategy }}
+        INPUT_REGISTRY: ${{ inputs.registry }}
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
+        INPUT_BAKE_FILE: ${{ steps.resolve-image.outputs.bake_file }}
+        INPUT_BAKE_TARGET: ${{ inputs.bake_target }}
+        # Same build secret the build step passed, so `bake --print` renders the
+        # identical tag set here (matters only if a bake file gates targets on it).
+        BAKE_GITHUB_TOKEN: ${{ inputs.build-github-token }}
+        SCAN_SEVERITY: ${{ inputs.image-scan-severity }}
+        SCANNERS: ${{ inputs.image-scan-scanners }}
+        SCAN_GATE: ${{ inputs.image-scan-gate }}
+        STRICT: ${{ inputs.image-scan-strict }}
+        DEPENDENCY_TRACK_URL: ${{ inputs.dependency-track-url }}
+        DEPENDENCY_TRACK_API_KEY: ${{ inputs.dependency-track-api-key }}
+        DEPENDENCY_TRACK_PROJECT_NAME: ${{ inputs.dependency-track-project-name }}
+        DEPENDENCY_TRACK_PROJECT_VERSION: ${{ inputs.dependency-track-project-version }}
+        DEPENDENCY_TRACK_AUTO_CREATE: ${{ inputs.dependency-track-auto-create }}
+        DEFECTDOJO_URL: ${{ inputs.defectdojo-url }}
+        DEFECTDOJO_API_KEY: ${{ inputs.defectdojo-api-key }}
+        DEFECTDOJO_ENGAGEMENT: ${{ inputs.defectdojo-engagement }}
+        DEFECTDOJO_PRODUCT_NAME: ${{ inputs.defectdojo-product-name }}
+        DEFECTDOJO_PRODUCT_TYPE: ${{ inputs.defectdojo-product-type }}
+        DEFECTDOJO_ENGAGEMENT_NAME: ${{ inputs.defectdojo-engagement-name }}
+        DEFECTDOJO_CLOSE_OLD: ${{ inputs.defectdojo-close-old }}
+      run: |
+        set -euo pipefail
+
+        # Re-resolve the bake env exactly as the build step did so `bake --print`
+        # renders the same tags that were just pushed.
+        OWNER_LOWER=$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')
+        export IMAGE_NAME="${OWNER_LOWER}/${INPUT_IMAGE_NAME}"
+        export REGISTRY="${INPUT_REGISTRY}"
+        export VERSION="${VERSION}"
+        # Empty INPUT_PLATFORMS ⇒ defer to docker-bake.hcl's own PLATFORMS default
+        # (see the pr-<N> build step). Never export an empty value — it breaks bake.
+        if [ -n "${INPUT_PLATFORMS}" ]; then export PLATFORMS="${INPUT_PLATFORMS}"; fi
+
+        # One ref per bake target — the canonical tag (tags[0]), which carries
+        # the pr-<N> version. This is the exact image that release promotes by
+        # digest, so what we scan here is what ships. The no-bake Dockerfile path
+        # pushed exactly one ref (${REGISTRY}/${IMAGE_NAME}:${VERSION}).
+        if [ "${STRATEGY}" = "dockerfile" ]; then
+          IMAGE_REFS="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+        else
+          IMAGE_REFS=$(docker buildx bake -f "${INPUT_BAKE_FILE}" "${INPUT_BAKE_TARGET}" --print 2>/dev/null \
+            | jq -r '.target[].tags[0] // empty' | sort -u)
+        fi
+        echo "Image refs to scan:"
+        echo "${IMAGE_REFS}"
+
+        IMAGE_REFS="${IMAGE_REFS}" "${GITHUB_ACTION_PATH}/scripts/scan-image.sh"
 
     # ═════════════════════════════════════════════════════════════════════════
     # RELEASE MODE — versioning
@@ -893,7 +1627,7 @@ runs:
                  --jq '.permission' 2>/dev/null || echo "")
         if [ -z "${PERM}" ]; then
           echo "::error::Could not check repo permission for ${ACTOR} on ${OWNER}/${REPO}."
-          echo "::error::The auth token needs Repository: Administration: Read. With auth-mode: public-app, grant that permission on the Release Runner App and accept it on the installation. To opt out of this guardrail, set admin-required-from: ''."
+          echo "::error::The auth token needs Repository: Administration: Read. With auth-mode: public-app, grant that permission on the Diatreme App and accept it on the installation. To opt out of this guardrail, set admin-required-from: ''."
           exit 1
         fi
         if [ "${PERM}" != "admin" ]; then
@@ -902,40 +1636,111 @@ runs:
         fi
         echo "✓ ${ACTOR} is a repo admin on ${OWNER}/${REPO} — manual release to '${CURRENT_ENV}' allowed."
 
+    # The guardrail above answers "is this person a repo admin", and only on a
+    # manual dispatch. Neither half is what most teams mean by "who may ship to
+    # production": repo admin also hands over settings, secrets and branch
+    # protection, and a push or a merged promotion PR walks straight past a
+    # workflow_dispatch-only check. This gate names principals instead, on every
+    # trigger. It runs BEFORE `Resolve versioning tool` so a refusal happens
+    # while nothing has been cut — no tag, no Release, no image.
+    - name: Release actor allowlist
+      if: inputs.mode == 'release' && inputs.allowed-release-actors != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.auth.outputs.token }}
+        # Both, not just github.actor: a re-run inherits the original run's
+        # actor, so checking that alone would let anyone with write access
+        # re-run an allowed person's failed release and cut production
+        # themselves. triggering_actor is who pressed re-run.
+        ACTOR: ${{ github.actor }}
+        TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        OWNER: ${{ github.repository_owner }}
+        ALLOWED_ACTORS: ${{ inputs.allowed-release-actors }}
+        THRESHOLD: ${{ inputs.allowed-release-actors-from }}
+        CURRENT_ENV: ${{ steps.detect-env.outputs.environment }}
+        ENVIRONMENTS: ${{ inputs.environments }}
+      run: "${GITHUB_ACTION_PATH}/scripts/check-release-actor.sh"
+
+    # Resolve the concrete versioning tool once, up front, so every tool step
+    # below (and the normalize step) gates on a single detected value rather
+    # than on the raw `versioning-tool` input. With `versioning-tool: auto`
+    # (the default) this inspects `working-directory` for release-tooling
+    # markers; with an explicit tool it validates and passes it through. Skipped
+    # when version-override is set, since that path bypasses versioning entirely.
+    - name: Resolve versioning tool
+      id: resolve-tool
+      if: inputs.mode == 'release' && inputs.version-override == ''
+      shell: bash
+      env:
+        INPUT_VERSIONING_TOOL: ${{ inputs.versioning-tool }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        GITVERSION_CONFIG: ${{ inputs.gitversion-config }}
+        RELEASE_PLEASE_CONFIG_FILE: ${{ inputs.release-please-config-file }}
+      run: "${GITHUB_ACTION_PATH}/scripts/detect-versioning-tool.sh"
+
+    # python-semantic-release publishes only a Docker action, and its image is
+    # built from a Dockerfile in their repo rather than pulled from a registry.
+    # GitHub Actions builds the image of every Docker action a composite action
+    # references during job setup — before any step runs, and regardless of the
+    # step's `if:` — so referencing it cost ~1 minute on *every* Diatreme
+    # release run, including the majority that resolve to another versioning
+    # tool and skip the psr step. We install the CLI from PyPI instead; it
+    # writes the same $GITHUB_OUTPUT keys (version, released, tag, ...) that the
+    # action exposed as outputs, so `steps.psr.outputs.*` is unchanged.
+    #
+    # `update-environment: false` keeps this interpreter out of PATH for the
+    # rest of the job — the Set up Python (package publishing) step owns that.
+    # 3.13 matches the python:3.13-bookworm base of the action container we
+    # replaced.
+    - name: Set up Python (semantic-release-python)
+      id: psr-python
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'semantic-release-python'
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: '3.13'
+        update-environment: false
+
     - name: Run python-semantic-release
       id: psr
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'semantic-release-python'
-      uses: python-semantic-release/python-semantic-release@v10
-      with:
-        github_token: ${{ steps.auth.outputs.token }}
-        git_committer_name: github-actions[bot]
-        prerelease: ${{ steps.detect-env.outputs.is_prerelease }}
-        prerelease_token: ${{ steps.detect-env.outputs.prerelease_identifier }}
-        force: ${{ inputs.force-bump }}
-        build: false
-        changelog: ${{ inputs.changelog }}
-        # Force vcs_release off here. The action's `create-release` input
-        # is honoured downstream by the Publish GitHub Release step, which
-        # runs *after* image promotion so `release:published` listeners
-        # see the versioned image in the registry. Letting psr create the
-        # release inline (its default) would re-introduce the image-vs-
-        # release race for any caller using the python-semantic-release
-        # tool. The tag is still pushed here so the rest of the pipeline
-        # (image promote, version-file inject, etc.) has the tag to work
-        # with.
-        vcs_release: false
-        commit: true
-        directory: ${{ inputs.working-directory }}
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'semantic-release-python'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        # The psr version is pinned in scripts/psr-requirements.txt, which the
+        # script installs with `pip install -r`. It lives in a requirements file
+        # so Dependabot's `pip` ecosystem keeps it current — a version string
+        # here would be invisible to every ecosystem, and the `github-actions`
+        # one only tracked it while this step was a `uses:` on the upstream
+        # Docker action.
+        PYTHON_BIN: ${{ steps.psr-python.outputs.python-path }}
+        GH_TOKEN: ${{ steps.auth.outputs.token }}
+        # `PSR_BIN` is a bats-only hook: when set, the script skips the install
+        # and execs it. Pin it empty so a caller's workflow/job `env:` — which
+        # composite steps inherit — can never redirect what we execute.
+        PSR_BIN: ''
+        INPUT_GIT_COMMITTER_NAME: github-actions[bot]
+        INPUT_PRERELEASE: ${{ steps.detect-env.outputs.is_prerelease }}
+        INPUT_PRERELEASE_TOKEN: ${{ steps.detect-env.outputs.prerelease_identifier }}
+        INPUT_FORCE: ${{ inputs.force-bump }}
+        INPUT_CHANGELOG: ${{ inputs.changelog }}
+      # The script fixes --commit, --skip-build and --no-vcs-release. psr must
+      # not create the release inline (its default): the `create-release` input
+      # is honoured downstream by the Publish GitHub Release step, which runs
+      # *after* image promotion so `release:published` listeners see the
+      # versioned image in the registry. The tag is still pushed here so the
+      # rest of the pipeline (image promote, version-file inject, etc.) has the
+      # tag to work with.
+      run: "${GITHUB_ACTION_PATH}/scripts/run-python-semantic-release.sh"
 
     - name: Set up Node.js (semantic-release-npm)
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'semantic-release-npm'
-      uses: actions/setup-node@v6
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'semantic-release-npm'
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: '20'
 
     - name: Run semantic-release (npm)
       id: semrel-npm
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'semantic-release-npm'
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'semantic-release-npm'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -948,6 +1753,7 @@ runs:
         DETECT_IDENTIFIER: ${{ steps.detect-env.outputs.prerelease_identifier }}
         INPUT_TAG_PREFIX: ${{ inputs.tag-prefix }}
         INPUT_PROMOTE_PREFIX: ${{ inputs.promote-branch-prefix }}
+        INPUT_FORCE_BUMP: ${{ inputs.force-bump }}
       run: |
         set -euo pipefail
         IS_PRERELEASE="${DETECT_IS_PRERELEASE}"
@@ -956,15 +1762,20 @@ runs:
         PROMOTE_PREFIX="${INPUT_PROMOTE_PREFIX}"
         HEAD_REF="${GITHUB_HEAD_REF:-}"
 
-        if ! npx --no semantic-release --version &>/dev/null; then
-          npm install --no-save \
-            semantic-release \
-            @semantic-release/changelog \
-            @semantic-release/commit-analyzer \
-            @semantic-release/git \
-            @semantic-release/github \
-            @semantic-release/release-notes-generator
-        fi
+        # Install semantic-release together with its plugins into the SAME
+        # node_modules, then run the locally-installed binary. Running via
+        # bare `npx semantic-release` can resolve semantic-release from an
+        # isolated `_npx/<hash>` cache whose node_modules does not contain the
+        # configured plugins, so non-bundled plugins like
+        # @semantic-release/changelog and @semantic-release/git fail with
+        # "Cannot find module '@semantic-release/changelog'". The plugin set is
+        # derived from the consumer's config (plus our baseline) so anything
+        # they configure is installed, not just a hard-coded list.
+        SEMREL_PKGS=$("${GITHUB_ACTION_PATH}/scripts/semantic-release-deps.sh")
+        echo "Installing semantic-release toolchain: ${SEMREL_PKGS}"
+        # shellcheck disable=SC2086 # word-splitting is intentional here.
+        npm install --no-save ${SEMREL_PKGS}
+        SEMREL_BIN="$(pwd)/node_modules/.bin/semantic-release"
 
         if [ "${IS_PRERELEASE}" == "true" ]; then
           NEXT_VER=""
@@ -975,6 +1786,17 @@ runs:
             BRANCH_VERSION=$(echo "${HEAD_REF}" | cut -d'/' -f3)
             NEXT_VER=$(echo "${BRANCH_VERSION}" | sed 's/-[a-zA-Z][^.]*\.[0-9]*$//')
             echo "Promotion: base version ${NEXT_VER} from branch ${HEAD_REF}"
+          elif [ -n "${INPUT_FORCE_BUMP}" ]; then
+            # Forced bump (typically a workflow_dispatch run with no
+            # qualifying conventional commits): skip both the
+            # qualifying-commit pre-check and the semantic-release dry-run,
+            # and derive the next version by bumping the latest stable tag
+            # at the requested level. The result flows into the shared
+            # `-${IDENTIFIER}.N` numbering below, so an existing prerelease
+            # line for that version is continued rather than restarted.
+            NEXT_VER=$(FORCE_BUMP="${INPUT_FORCE_BUMP}" TAG_PREFIX="${PREFIX}" \
+              "${GITHUB_ACTION_PATH}/scripts/force-bump-version.sh")
+            echo "force-bump=${INPUT_FORCE_BUMP}: next version ${NEXT_VER}"
           else
             # Direct push to trunk: skip if no new qualifying commits since the
             # last prerelease tag for this identifier (prevents spurious releases
@@ -992,7 +1814,7 @@ runs:
             fi
             # semantic-release v24 ignores --prerelease on stable branches; use
             # dry-run to get the next stable version, then create the tag manually.
-            DRY_RUN_OUTPUT=$(npx semantic-release --dry-run 2>&1 || true)
+            DRY_RUN_OUTPUT=$("${SEMREL_BIN}" --dry-run 2>&1 || true)
             echo "=== semantic-release dry-run output ==="
             echo "${DRY_RUN_OUTPUT}"
             echo "======================================="
@@ -1010,45 +1832,20 @@ runs:
             fi
             NEW_TAG="${PREFIX}${NEXT_VER}-${IDENTIFIER}.${PRE_NUM}"
             echo "Creating prerelease tag: ${NEW_TAG}"
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            REMOTE_URL=$(git remote get-url origin)
-            AUTHED_URL=$(echo "${REMOTE_URL}" | sed "s|https://|https://x-access-token:${GITHUB_TOKEN}@|")
-
-            # Concurrency safety: a parallel run may have just published
-            # the same tag. Check the remote first; on push race we re-
-            # check and exit gracefully.
-            if git ls-remote --tags "${AUTHED_URL}" "refs/tags/${NEW_TAG}" 2>/dev/null | grep -Fq "refs/tags/${NEW_TAG}"; then
-              echo "::notice::Tag ${NEW_TAG} already exists on remote (parallel run won the race). Treating as no-op release."
-              echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-              echo "released=false"        >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            git tag "${NEW_TAG}"
-            if ! git push "${AUTHED_URL}" "${NEW_TAG}" 2>/tmp/tag_push.err; then
-              if git ls-remote --tags "${AUTHED_URL}" "refs/tags/${NEW_TAG}" 2>/dev/null | grep -Fq "refs/tags/${NEW_TAG}"; then
-                echo "::notice::Tag ${NEW_TAG} now exists on remote (parallel run beat us between check and push). Skipping."
-                git tag -d "${NEW_TAG}" 2>/dev/null || true
-                echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-                echo "released=false"        >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              echo "::error::Failed to push tag ${NEW_TAG}: $(cat /tmp/tag_push.err 2>/dev/null | head -3)"
-              exit 1
-            fi
-            # GitHub Release is published in a later step, after image
-            # promotion, so downstream `release:published` listeners see
-            # versioned images in the registry. The custom prerelease
-            # note is threaded through outputs so the deferred publish
-            # step preserves the original message format instead of
-            # falling back to GitHub's auto-generated notes.
-            echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-            echo "released=true"         >> "$GITHUB_OUTPUT"
-            echo "release_notes=Pre-release ${IDENTIFIER}.${PRE_NUM} for version ${NEXT_VER}" >> "$GITHUB_OUTPUT"
+            # Create + push the prerelease tag via the shared race-safe helper
+            # (handles https + git@ remotes and a per-invocation stderr temp
+            # file), which emits latest_tag + released. The GitHub Release is
+            # published in a later step, after image promotion, so downstream
+            # `release:published` listeners see versioned images in the registry;
+            # the custom prerelease note is threaded through `release_notes` —
+            # emitted ONLY on a real release, so the deferred publish step keeps
+            # the original message instead of GitHub's auto-generated notes.
+            TAG="${NEW_TAG}" \
+            RELEASE_NOTES="Pre-release ${IDENTIFIER}.${PRE_NUM} for version ${NEXT_VER}" \
+              "${GITHUB_ACTION_PATH}/scripts/push-release-tag.sh"
           else
             echo "No relevant commits for prerelease — skipping"
-            EXISTING_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            EXISTING_TAG=$(PREFIX="${PREFIX}" "${GITHUB_ACTION_PATH}/scripts/latest-tag.sh")
             echo "latest_tag=${EXISTING_TAG}" >> "$GITHUB_OUTPUT"
             echo "released=false"             >> "$GITHUB_OUTPUT"
           fi
@@ -1061,44 +1858,33 @@ runs:
             STABLE_VER=$(echo "${BRANCH_VERSION}" | sed 's/-[a-zA-Z][^.]*\.[0-9]*$//')
             NEW_TAG="${PREFIX}${STABLE_VER}"
             echo "Stable release: ${NEW_TAG} from promotion branch ${HEAD_REF}"
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            REMOTE_URL=$(git remote get-url origin)
-            AUTHED_URL=$(echo "${REMOTE_URL}" | sed "s|https://|https://x-access-token:${GITHUB_TOKEN}@|")
-
-            # Concurrency safety: same race protection as the prerelease
-            # path above — a parallel run may have already cut this stable.
-            if git ls-remote --tags "${AUTHED_URL}" "refs/tags/${NEW_TAG}" 2>/dev/null | grep -Fq "refs/tags/${NEW_TAG}"; then
-              echo "::notice::Tag ${NEW_TAG} already exists on remote (parallel run won the race). Treating as no-op release."
-              echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-              echo "released=false"        >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            git tag "${NEW_TAG}"
-            if ! git push "${AUTHED_URL}" "${NEW_TAG}" 2>/tmp/tag_push.err; then
-              if git ls-remote --tags "${AUTHED_URL}" "refs/tags/${NEW_TAG}" 2>/dev/null | grep -Fq "refs/tags/${NEW_TAG}"; then
-                echo "::notice::Tag ${NEW_TAG} now exists on remote (parallel run beat us). Skipping."
-                git tag -d "${NEW_TAG}" 2>/dev/null || true
-                echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-                echo "released=false"        >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-              echo "::error::Failed to push tag ${NEW_TAG}: $(cat /tmp/tag_push.err 2>/dev/null | head -3)"
-              exit 1
-            fi
-            # GitHub Release is published in a later step, after image
-            # promotion, so downstream `release:published` listeners see
-            # versioned images in the registry.
-            echo "latest_tag=${NEW_TAG}" >> "$GITHUB_OUTPUT"
-            echo "released=true"         >> "$GITHUB_OUTPUT"
+            # Create + push the stable tag via the shared race-safe helper (same
+            # https + git@ + per-invocation-tmp handling as the prerelease path);
+            # it emits latest_tag + released. The GitHub Release is published in a
+            # later step, after image promotion, so downstream `release:published`
+            # listeners see versioned images in the registry.
+            TAG="${NEW_TAG}" "${GITHUB_ACTION_PATH}/scripts/push-release-tag.sh"
+          elif [ -n "${INPUT_FORCE_BUMP}" ]; then
+            # Forced stable bump: semantic-release has no per-run force
+            # knob, so bump the latest stable tag ourselves and push it via
+            # the shared race-safe helper (it emits `released=true|false`
+            # to $GITHUB_OUTPUT). semantic-release itself is skipped, so
+            # config-driven publish plugins (changelog commit, npm publish,
+            # ...) do not run for a forced release; the GitHub Release is
+            # still published by the deferred publish step.
+            NEXT_VER=$(FORCE_BUMP="${INPUT_FORCE_BUMP}" TAG_PREFIX="${PREFIX}" \
+              "${GITHUB_ACTION_PATH}/scripts/force-bump-version.sh")
+            NEW_TAG="${PREFIX}${NEXT_VER}"
+            echo "force-bump=${INPUT_FORCE_BUMP}: creating stable tag ${NEW_TAG}"
+            TAG="${NEW_TAG}" MESSAGE="chore(release): ${NEW_TAG}" \
+              "${GITHUB_ACTION_PATH}/scripts/push-release-tag.sh"
           else
             # Direct push or workflow_dispatch: run semantic-release normally.
             # Use || true so non-critical post-hook failures (e.g. PR label
             # permissions) don't abort the step after the release is published.
-            PRE_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-            npx semantic-release || echo "::warning::semantic-release exited non-zero (release may still have been created)"
-            LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            PRE_TAG=$(PREFIX="${PREFIX}" "${GITHUB_ACTION_PATH}/scripts/latest-tag.sh")
+            "${SEMREL_BIN}" || echo "::warning::semantic-release exited non-zero (release may still have been created)"
+            LATEST_TAG=$(PREFIX="${PREFIX}" "${GITHUB_ACTION_PATH}/scripts/latest-tag.sh")
             echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
             if [ -n "${LATEST_TAG}" ] && [ "${LATEST_TAG}" != "${PRE_TAG}" ]; then
               echo "released=true"  >> "$GITHUB_OUTPUT"
@@ -1109,17 +1895,29 @@ runs:
         fi
 
     - name: Install GitVersion
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'gitversion'
-      uses: gittools/actions/gitversion/setup@v4
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'gitversion'
+      uses: gittools/actions/gitversion/setup@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
       with:
         versionSpec: ${{ inputs.gitversion-spec }}
 
     - name: Execute GitVersion
       id: gitversion
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'gitversion'
-      uses: gittools/actions/gitversion/execute@v4
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'gitversion'
+      uses: gittools/actions/gitversion/execute@7417b1089e2c7de93510f1901d656ddf60bb024f # v4.7.0
       with:
-        configFilePath: ${{ inputs.gitversion-config }}
+        # Resolved by the detect step rather than read from the raw input,
+        # because this action never sets `targetPath` — gittools therefore
+        # resolves configFilePath against the workspace root, while detection
+        # is scoped to `working-directory`. Taking the path from the detect
+        # step keeps the two in agreement for a subdirectory project.
+        #
+        # gittools only passes `/config` when this is non-empty, and hard-errors
+        # when it names a file that does not exist, so the detect step emits:
+        # an explicit `gitversion-config` verbatim (a bad path must still fail
+        # loudly), else the GitVersion.yml/.yaml it found under
+        # `working-directory`, else empty — which is what lets a repo resolved
+        # from a bare *.csproj/*.sln run on GitVersion's built-in defaults.
+        configFilePath: ${{ steps.resolve-tool.outputs.config }}
         # GitVersion accepts /overrideconfig flags; map force-bump onto its
         # `increment` knob. Empty force-bump leaves GitVersion's branch
         # rules in charge. gittools/actions@v4 takes one key=value per
@@ -1135,7 +1933,7 @@ runs:
 
     - name: Create GitVersion release tag
       id: gitversion-tag
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'gitversion'
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'gitversion'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ steps.auth.outputs.token }}
@@ -1199,8 +1997,8 @@ runs:
 
     - name: Run release-please
       id: release-please
-      if: inputs.mode == 'release' && inputs.version-override == '' && inputs.versioning-tool == 'release-please'
-      uses: googleapis/release-please-action@v5
+      if: inputs.mode == 'release' && inputs.version-override == '' && steps.resolve-tool.outputs.tool == 'release-please'
+      uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
       with:
         token: ${{ steps.auth.outputs.token }}
         release-type: ${{ inputs.release-please-release-type }}
@@ -1211,7 +2009,7 @@ runs:
       if: inputs.mode == 'release'
       shell: bash
       env:
-        INPUT_TOOL: ${{ inputs.versioning-tool }}
+        INPUT_TOOL: ${{ steps.resolve-tool.outputs.tool }}
         INPUT_PREFIX: ${{ inputs.tag-prefix }}
         INPUT_VERSION_OVERRIDE: ${{ inputs.version-override }}
         OVERRIDE_TAG_VERSION: ${{ steps.version-override-tag.outputs.version }}
@@ -1278,7 +2076,12 @@ runs:
           esac
         fi
         if [ -z "${VERSION}" ]; then
-          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          # Scoped to PREFIX. This fallback feeds the `version` output that the
+          # image tag, the published package and the GitHub Release all derive
+          # from, so in a repo releasing more than one package an unscoped
+          # lookup here republishes package A under package B's version — with
+          # every step green.
+          LATEST=$(PREFIX="${PREFIX}" "${GITHUB_ACTION_PATH}/scripts/latest-tag.sh")
           if [ -n "${LATEST}" ]; then
             VERSION="${LATEST#${PREFIX}}"
             TAG="${LATEST}"
@@ -1291,16 +2094,23 @@ runs:
         echo "Tool: ${TOOL} | Version: ${VERSION} | Tag: ${TAG} | Released: ${RELEASED}"
 
     # ═════════════════════════════════════════════════════════════════════════
-    # RELEASE MODE — Persist version into a tracked file (any tool)
+    # RELEASE MODE — Persist version into tracked file(s) (any tool)
     # ═════════════════════════════════════════════════════════════════════════
     #
-    # Common in .NET deployments (e.g. appsettings.json) where the running
-    # app needs to know its own version. JSON only; the injection step
-    # uses jq and warns-and-skips on non-JSON content. Works with every
-    # versioning tool and runs only when a release was created.
+    # Common in .NET deployments (e.g. appsettings.json) and Helm charts
+    # (Chart.yaml appVersion) where the running app or chart needs to know
+    # its own version. JSON files are processed with jq; YAML files (.yaml/
+    # .yml) are processed with yq. Works with every versioning tool and runs
+    # only when a release was created.
+    #
+    # `version-file` takes several paths and globs, and everything it matches
+    # moves in ONE commit: a repository that carries the same version in more
+    # than one manifest is either consistent at the new version or untouched.
+    # Half-updated manifests drift silently, and the one that lies is the one
+    # somebody eventually trusts.
     #
     # The push uses the resolved release auth token, so it bypasses branch
-    # protection rulesets when the Release Runner App (or your private app)
+    # protection rulesets when the Diatreme App (or your private app)
     # is in the bypass list. The commit message ends with `[skip ci]` so
     # the push does not retrigger the release workflow.
 
@@ -1315,127 +2125,37 @@ runs:
         GITHUB_TOKEN: ${{ steps.auth.outputs.token }}
         INPUT_VERSION_FILE: ${{ inputs.version-file }}
         INPUT_VERSION_FILE_JSON_PATH: ${{ inputs.version-file-json-path }}
+        INPUT_VERSION_FILE_YAML_PATH: ${{ inputs.version-file-yaml-path }}
         INPUT_GITVERSION_APPSETTINGS_FILE: ${{ inputs.gitversion-appsettings-file }}
         INPUT_GITVERSION_APPSETTINGS_VERSION_PATH: ${{ inputs.gitversion-appsettings-version-path }}
         NORMALIZE_VERSION: ${{ steps.normalize.outputs.version }}
-      run: |
-        set -euo pipefail
-
-        # Prefer the new generic input. Fall back to the deprecated gitversion-prefixed
-        # alias so existing callers keep working.
-        FILE="${INPUT_VERSION_FILE}"
-        JSON_PATH="${INPUT_VERSION_FILE_JSON_PATH}"
-        if [ -z "${FILE}" ]; then
-          FILE="${INPUT_GITVERSION_APPSETTINGS_FILE}"
-          if [ -n "${INPUT_GITVERSION_APPSETTINGS_VERSION_PATH}" ]; then
-            JSON_PATH="${INPUT_GITVERSION_APPSETTINGS_VERSION_PATH}"
-          fi
-          echo "::notice::gitversion-appsettings-file is deprecated; use version-file."
-        fi
-
-        VERSION="${NORMALIZE_VERSION}"
-
-        if [ ! -f "${FILE}" ]; then
-          echo "::warning::version-file '${FILE}' not found — skipping injection."
-          exit 0
-        fi
-        if [ -z "${VERSION}" ]; then
-          echo "::warning::No version resolved — skipping injection."
-          exit 0
-        fi
-
-        # Tolerate a bad path expression or non-JSON content rather than
-        # failing the release — version-file is opt-in plumbing and
-        # mis-configuring it should warn, not block the publish.
-        TMP=$(mktemp)
-        if ! jq --arg v "${VERSION}" "${JSON_PATH} = \$v" "${FILE}" > "${TMP}" 2>/tmp/jq.err; then
-          echo "::warning::Failed to inject version into ${FILE} at path '${JSON_PATH}': $(cat /tmp/jq.err 2>/dev/null | head -1). Skipping."
-          rm -f "${TMP}"
-          exit 0
-        fi
-        if ! mv "${TMP}" "${FILE}"; then
-          echo "::warning::Failed to write ${FILE} after injection — skipping."
-          exit 0
-        fi
-        echo "Injected version ${VERSION} into ${FILE} at ${JSON_PATH}"
-
-        git config user.name  "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add "${FILE}"
-        if git diff --cached --quiet; then
-          echo "No changes to commit — file already at ${VERSION}."
-          exit 0
-        fi
-
-        git commit -m "chore(release): persist version ${VERSION} in $(basename "${FILE}") [skip ci]"
-
-        # Concurrency-safe push loop: another run on the same branch may
-        # land a commit (Flux image bump, parallel release run, etc.)
-        # between our fetch and our push. We rebase, push, and on
-        # rejection re-fetch and retry up to MAX_ATTEMPTS times with
-        # short backoff. The reusable workflow at
-        # .github/workflows/release-runner.yaml serialises runs at the
-        # workflow level via a `concurrency:` group; this loop closes
-        # the small window the lock can't cover (e.g. concurrent commits
-        # from automation outside the workflow group).
-        BRANCH="${GITHUB_REF_NAME}"
-        REMOTE_URL=$(git remote get-url origin)
-        AUTHED_URL=$(echo "${REMOTE_URL}" | sed "s|https://|https://x-access-token:${GITHUB_TOKEN}@|")
-        MAX_ATTEMPTS=5
-
-        for attempt in $(seq 1 ${MAX_ATTEMPTS}); do
-          git fetch origin "${BRANCH}" 2>&1 | tail -3 || true
-          if ! git rebase "origin/${BRANCH}"; then
-            git rebase --abort 2>/dev/null || true
-            if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
-              echo "::warning::Could not rebase ${FILE} commit onto latest ${BRANCH} after ${MAX_ATTEMPTS} attempts; skipping push."
-              exit 0
-            fi
-            sleep $((attempt * 2))
-            continue
-          fi
-
-          if git push "${AUTHED_URL}" "HEAD:${BRANCH}" 2>/tmp/push.err; then
-            echo "Pushed ${FILE} update for ${VERSION} to ${BRANCH} on attempt ${attempt}/${MAX_ATTEMPTS}."
-            exit 0
-          fi
-
-          # Common race: another run pushed between our fetch and push.
-          # Re-fetch and retry. Stop early if the failure is non-recoverable
-          # (e.g. branch protection rejection without bypass).
-          if grep -qiE "non-fast-forward|fetch first|stale" /tmp/push.err; then
-            echo "Push attempt ${attempt}/${MAX_ATTEMPTS} lost a race; will rebase + retry"
-            sleep $((attempt * 2))
-            continue
-          fi
-
-          # Anything else (auth failure, ruleset block, etc.) — don't keep
-          # banging on the door; surface it as a warning and move on so
-          # the rest of the release flow still completes.
-          echo "::warning::Could not push ${FILE} commit: $(cat /tmp/push.err | head -3). Continuing release."
-          exit 0
-        done
-
-        echo "::warning::Exhausted ${MAX_ATTEMPTS} push attempts for ${FILE} on ${BRANCH}; skipping push."
+      run: "${GITHUB_ACTION_PATH}/scripts/inject-version-files.sh"
 
     # ═════════════════════════════════════════════════════════════════════════
     # RELEASE MODE — Docker image promotion
     # ═════════════════════════════════════════════════════════════════════════
 
     - name: Set up Docker Buildx (release)
-      if: inputs.mode == 'release' && inputs.image_name != '' && steps.normalize.outputs.released == 'true'
-      uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true'
+      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      with:
+        # See the CI Buildx step: run buildkit + RUN sandboxes on the host network so
+        # docker-in-docker self-hosted runners with a reduced pod MTU (flannel VXLAN
+        # ~1450) don't blackhole large packets in RUN steps. No-op on GitHub-hosted.
+        driver-opts: network=host
+        buildkitd-flags: --oci-worker-net=host
 
     - name: Log in to container registry (release)
-      if: inputs.mode == 'release' && inputs.image_name != '' && steps.normalize.outputs.released == 'true'
-      uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true'
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ${{ inputs.registry }}
         username: ${{ inputs.registry-username || github.actor }}
         password: ${{ inputs.registry-password || steps.auth.outputs.registry-token }}
 
     - name: Promote images
-      if: inputs.mode == 'release' && inputs.image_name != '' && steps.normalize.outputs.released == 'true'
+      id: promote-images
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ steps.auth.outputs.token }}
@@ -1449,11 +2169,14 @@ runs:
         INPUT_PRERELEASE_IDENTIFIERS: ${{ inputs.prerelease-identifiers }}
         INPUT_TAG_PREFIX: ${{ inputs.tag-prefix }}
         OWNER: ${{ github.repository_owner }}
-        INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+        INPUT_IMAGE_NAME: ${{ steps.resolve-image.outputs.image_name }}
+        STRATEGY: ${{ steps.resolve-image.outputs.strategy }}
         INPUT_REGISTRY: ${{ inputs.registry }}
         INPUT_PLATFORMS: ${{ inputs.platforms }}
-        INPUT_BAKE_FILE: ${{ inputs.bake_file }}
+        INPUT_BAKE_FILE: ${{ steps.resolve-image.outputs.bake_file }}
         INPUT_BAKE_TARGET: ${{ inputs.bake_target }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        INPUT_IMAGE_SKIP_EXISTING: ${{ inputs.image-skip-existing }}
         REPO_FULL: ${{ github.repository }}
       run: |
         set -euo pipefail
@@ -1471,11 +2194,19 @@ runs:
         export IMAGE_NAME="${OWNER_LOWER}/${INPUT_IMAGE_NAME}"
         export REGISTRY="${INPUT_REGISTRY}"
         export VERSION="${VERSION}"
-        export PLATFORMS="${INPUT_PLATFORMS}"
+        # Empty INPUT_PLATFORMS ⇒ defer to docker-bake.hcl's own PLATFORMS default
+        # (see the pr-<N> build step). Never export an empty value — it breaks bake.
+        if [ -n "${INPUT_PLATFORMS}" ]; then export PLATFORMS="${INPUT_PLATFORMS}"; fi
 
-        # Discover all bake targets
-        BAKE_OUTPUT=$(docker buildx bake -f "${INPUT_BAKE_FILE}" "${INPUT_BAKE_TARGET}" --print 2>/dev/null)
-        IMAGES=$(echo "${BAKE_OUTPUT}" | jq -c '.target | to_entries | map({target: .key, image: (.value.tags[0] // "" | split(":")[0])})')
+        # Discover the image(s) to promote. Bake enumerates every target; the
+        # no-bake Dockerfile path has a single image, ${REGISTRY}/${IMAGE_NAME}
+        # (the same repo the CI Dockerfile build pushed pr-<N> to).
+        if [ "${STRATEGY}" = "dockerfile" ]; then
+          IMAGES=$(jq -cn --arg image "${REGISTRY}/${IMAGE_NAME}" '[{target: "dockerfile", image: $image}]')
+        else
+          BAKE_OUTPUT=$(docker buildx bake -f "${INPUT_BAKE_FILE}" "${INPUT_BAKE_TARGET}" --print 2>/dev/null)
+          IMAGES=$(echo "${BAKE_OUTPUT}" | jq -c '.target | to_entries | map({target: .key, image: (.value.tags[0] // "" | split(":")[0])})')
+        fi
         echo "Images to promote: ${IMAGES}"
 
         # Determine promotion strategy
@@ -1499,6 +2230,7 @@ runs:
 
         # Resolve source tag suffix
         SOURCE_TAG_SUFFIX=""
+        RELEASE_COMMIT=""
         if [ "${IS_FIRST_ENV}" == "true" ]; then
           # Find the PR associated with this release tag via GitHub API
           COMMIT_SHA=$(gh api "repos/${REPO_FULL}/git/ref/tags/${TAG}" \
@@ -1531,7 +2263,10 @@ runs:
 
             if [ -n "${PR_NUMBER}" ]; then
               SOURCE_TAG_SUFFIX="pr-${PR_NUMBER}"
-              echo "Source: pr-${PR_NUMBER}"
+              # The commit the PR walk stopped on is the PR's merge/squash
+              # commit — the provenance anchor the pr-<N> image must match.
+              RELEASE_COMMIT="${CURRENT_SHA}"
+              echo "Source: pr-${PR_NUMBER} (merged as ${RELEASE_COMMIT})"
             else
               echo "::warning::Could not find PR for tag ${TAG} — will fall back to fresh build"
             fi
@@ -1550,6 +2285,12 @@ runs:
           fi
         fi
 
+        # Per-image outcomes are tallied through a FILE, not a variable: the
+        # loop below is the right-hand side of a pipe, so its body runs in a
+        # subshell and every assignment made in it dies with that subshell.
+        COUNTS_FILE=$(mktemp)
+        export COUNTS_FILE
+
         # Promote each image
         echo "${IMAGES}" | jq -c '.[]' | while IFS= read -r item; do
           TARGET=$(echo "${item}" | jq -r '.target')
@@ -1557,7 +2298,81 @@ runs:
           NEW_TAG="${IMAGE}:${TAG}"
 
           PROMOTED="false"
-          if [ -n "${SOURCE_TAG_SUFFIX}" ]; then
+
+          # Provenance gate for pr-<N> sources: a PR merged while behind the
+          # branch tip keeps the CI image built from its last (stale)
+          # synthetic merge, and promoting it ships old code under the new
+          # release tag (nievah shipped v1.4.0-era code as v1.6.1 this way).
+          # verify-promote-source.sh compares the git tree the image was
+          # built from — labels stamped by mode: ci — against the release
+          # commit's tree; a mismatch, or an image that cannot be verified,
+          # drops to the fresh-build fallback below. Later-environment
+          # promotions are exempt: carrying the previous environment's
+          # artifact forward unchanged is their entire point.
+          VERIFIED="true"
+          if [ -n "${SOURCE_TAG_SUFFIX}" ] && [ "${IS_FIRST_ENV}" == "true" ]; then
+            if ! SOURCE="${IMAGE}:${SOURCE_TAG_SUFFIX}" RELEASE_COMMIT="${RELEASE_COMMIT}" REPO_FULL="${REPO_FULL}" \
+                 "${GITHUB_ACTION_PATH}/scripts/verify-promote-source.sh"; then
+              VERIFIED="false"
+            fi
+          fi
+
+          # Opt-in skip gate, deliberately placed AFTER the provenance check and
+          # gated on it: a re-run of a promote that already landed should not
+          # redo it, but "a tag with that name exists" is not evidence that it
+          # did. A tag is a mutable pointer, and every holder of `packages:
+          # write` on the registry can create one — skipping on mere existence
+          # would let an image this pipeline never built be released, signed and
+          # attested, and would bypass the staleness gate directly above.
+          #
+          # So the gate skips only on identity: the release tag must already
+          # resolve to the same manifest digest as the source we were about to
+          # retag, and on a stable release `:latest` must resolve there too —
+          # otherwise an interrupted promote that wrote the version tag but not
+          # `:latest` would be recorded as done while `:latest` still served the
+          # previous release. Anything unproven falls through and does the work.
+          #
+          # It follows that the gate cannot short-circuit the fresh-build
+          # fallback below: a rebuild's digest is not knowable in advance. That
+          # is a real limit, not an oversight, and it is documented as one.
+          if [ "${INPUT_IMAGE_SKIP_EXISTING:-false}" = "true" ] \
+             && [ -n "${SOURCE_TAG_SUFFIX}" ] && [ "${VERIFIED}" == "true" ]; then
+            DIGEST_TMP=$(mktemp)
+            EXISTING_DIGEST=""
+            SOURCE_DIGEST=""
+            LATEST_MATCHES="true"
+
+            if IMAGE_REF="${NEW_TAG}" DIGEST_FILE="${DIGEST_TMP}" \
+               "${GITHUB_ACTION_PATH}/scripts/probe-image-tag.sh"; then
+              EXISTING_DIGEST=$(cat "${DIGEST_TMP}")
+            fi
+            if [ -n "${EXISTING_DIGEST}" ] \
+               && IMAGE_REF="${IMAGE}:${SOURCE_TAG_SUFFIX}" DIGEST_FILE="${DIGEST_TMP}" \
+                  "${GITHUB_ACTION_PATH}/scripts/probe-image-tag.sh"; then
+              SOURCE_DIGEST=$(cat "${DIGEST_TMP}")
+            fi
+            if [ -n "${EXISTING_DIGEST}" ] && [ "${IS_PRERELEASE}" == "false" ]; then
+              LATEST_MATCHES="false"
+              if IMAGE_REF="${IMAGE}:latest" DIGEST_FILE="${DIGEST_TMP}" \
+                 "${GITHUB_ACTION_PATH}/scripts/probe-image-tag.sh" \
+                 && [ "$(cat "${DIGEST_TMP}")" == "${EXISTING_DIGEST}" ]; then
+                LATEST_MATCHES="true"
+              fi
+            fi
+            rm -f "${DIGEST_TMP}"
+
+            if [ -n "${EXISTING_DIGEST}" ] && [ "${EXISTING_DIGEST}" == "${SOURCE_DIGEST}" ] \
+               && [ "${LATEST_MATCHES}" == "true" ]; then
+              echo "${NEW_TAG} already resolves to ${EXISTING_DIGEST}, the manifest this run would publish — skipping promote (image-skip-existing)."
+              echo skipped >> "${COUNTS_FILE}"
+              continue
+            fi
+            if [ -n "${EXISTING_DIGEST}" ] && [ "${LATEST_MATCHES}" != "true" ]; then
+              echo "${NEW_TAG} is already published but ${IMAGE}:latest points elsewhere — promoting anyway so :latest is repaired."
+            fi
+          fi
+
+          if [ -n "${SOURCE_TAG_SUFFIX}" ] && [ "${VERIFIED}" == "true" ]; then
             SOURCE="${IMAGE}:${SOURCE_TAG_SUFFIX}"
 
             # Primary retag: `docker buildx imagetools create`. Preserves
@@ -1609,6 +2424,7 @@ runs:
                 echo "Promoted ${SOURCE} → ${NEW_TAG} via ${RETAG_METHOD}"
               fi
               PROMOTED="true"
+              echo promoted >> "${COUNTS_FILE}"
             else
               echo "::warning::retag of ${SOURCE} → ${NEW_TAG} failed (last method: ${RETAG_METHOD}); falling back to fresh build."
             fi
@@ -1616,17 +2432,226 @@ runs:
 
           if [ "${PROMOTED}" == "false" ]; then
             echo "Fresh build fallback for ${IMAGE} (${TARGET})"
-            EXTRA_TAGS=""
-            [ "${IS_PRERELEASE}" == "false" ] && EXTRA_TAGS="--set ${TARGET}.tags=${IMAGE}:latest"
-            docker buildx bake \
-              -f "${INPUT_BAKE_FILE}" "${TARGET}" \
-              --set "${TARGET}.tags=${NEW_TAG}" \
-              ${EXTRA_TAGS} \
-              --set "${TARGET}.cache-from=type=gha,scope=buildkit-${TARGET}" \
-              --set "${TARGET}.cache-to=type=gha,mode=max,scope=buildkit-${TARGET}" \
-              --push
+            if [ "${STRATEGY}" = "dockerfile" ]; then
+              # No bake file — rebuild the Dockerfile directly at the release tag
+              # (+ :latest for a stable release). One newline-separated --tag per ref.
+              FRESH_TAGS="${NEW_TAG}"
+              [ "${IS_PRERELEASE}" == "false" ] && FRESH_TAGS="$(printf '%s\n%s' "${NEW_TAG}" "${IMAGE}:latest")"
+              export BUILD_GITHUB_TOKEN="${BAKE_GITHUB_TOKEN}"
+              TAGS="${FRESH_TAGS}" \
+              DOCKERFILE="${INPUT_DOCKERFILE}" \
+              PLATFORMS="${INPUT_PLATFORMS}" \
+              CACHE_SCOPE="buildkit-dockerfile" \
+                "${GITHUB_ACTION_PATH}/scripts/build-image-dockerfile.sh"
+            else
+              # REPEATED `--set <target>.tags=` APPENDS; it does not replace. Verified on
+              # buildx v0.34.0:
+              #
+              #   --set default.tags=x:v1 --set default.tags=x:latest
+              #     -> ["x:v1", "x:latest"]           correct
+              #   --set default.tags=x:v1,x:latest
+              #     -> ["x:v1,x:latest"]              ONE tag containing a comma
+              #
+              # The comma form produced `ERROR: invalid tag "...:v1,...:latest": invalid
+              # reference format` and failed the whole release, so a version bump landed on
+              # main with no image and no GitHub Release behind it. Only this path was
+              # affected (fresh-build fallback + non-prerelease), which is why it survived
+              # every ordinary promote.
+              BAKE_TAG_ARGS=(--set "${TARGET}.tags=${NEW_TAG}")
+              if [ "${IS_PRERELEASE}" == "false" ]; then
+                BAKE_TAG_ARGS+=(--set "${TARGET}.tags=${IMAGE}:latest")
+              fi
+              docker buildx bake \
+                -f "${INPUT_BAKE_FILE}" "${TARGET}" \
+                "${BAKE_TAG_ARGS[@]}" \
+                --set "${TARGET}.cache-from=type=gha,scope=buildkit-${TARGET}" \
+                --set "${TARGET}.cache-to=type=gha,mode=max,scope=buildkit-${TARGET}" \
+                --push
+            fi
+            # Tallied once the build has actually landed, so the count reports
+            # images that were rebuilt rather than images we set out to rebuild.
+            echo rebuilt >> "${COUNTS_FILE}"
           fi
         done
+
+        # `grep -c` exits 1 when it matches nothing, which `set -e` would treat
+        # as a failed promote step — on the very run where every image was
+        # skipped or every one was rebuilt. It still prints the 0.
+        PROMOTED_COUNT=$(grep -c '^promoted$' "${COUNTS_FILE}" || true)
+        SKIPPED_COUNT=$(grep -c '^skipped$' "${COUNTS_FILE}" || true)
+        REBUILT_COUNT=$(grep -c '^rebuilt$' "${COUNTS_FILE}" || true)
+        rm -f "${COUNTS_FILE}"
+
+        echo "Promote: ${PROMOTED_COUNT} promoted, ${SKIPPED_COUNT} skipped, ${REBUILT_COUNT} rebuilt."
+        {
+          echo "promoted_count=${PROMOTED_COUNT}"
+          echo "skipped_count=${SKIPPED_COUNT}"
+          echo "rebuilt_count=${REBUILT_COUNT}"
+        } >> "$GITHUB_OUTPUT"
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # RELEASE MODE — sign the released image(s) + SLSA build provenance (opt-in)
+    # ═════════════════════════════════════════════════════════════════════════
+    #
+    # Signs whatever the promote step shipped — a retag of the verified pr-<N>
+    # image OR a fresh release build — by IMMUTABLE DIGEST, so it covers both
+    # paths and only ever signs real releases (never throwaway PR images). This
+    # makes a cluster's cosign `verifyImages` admission policy enforceable for
+    # these images. Opt-in via `image-sign: true`; needs `attestations: write`
+    # (plus the `id-token` / `packages: write` the release image flow already needs).
+    - name: Install cosign
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true' && inputs.image-sign == 'true'
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+    - name: Sign released images (cosign)
+      id: sign-image
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true' && inputs.image-sign == 'true'
+      shell: bash
+      env:
+        OWNER: ${{ github.repository_owner }}
+        INPUT_IMAGE_NAME: ${{ steps.resolve-image.outputs.image_name }}
+        STRATEGY: ${{ steps.resolve-image.outputs.strategy }}
+        INPUT_REGISTRY: ${{ inputs.registry }}
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
+        INPUT_BAKE_FILE: ${{ steps.resolve-image.outputs.bake_file }}
+        INPUT_BAKE_TARGET: ${{ inputs.bake_target }}
+        BAKE_GITHUB_TOKEN: ${{ inputs.build-github-token }}
+        NORMALIZE_VERSION: ${{ steps.normalize.outputs.version }}
+        NORMALIZE_TAG: ${{ steps.normalize.outputs.tag }}
+      run: |
+        set -euo pipefail
+
+        OWNER_LOWER=$(echo "${OWNER}" | tr '[:upper:]' '[:lower:]')
+        export IMAGE_NAME="${OWNER_LOWER}/${INPUT_IMAGE_NAME}"
+        export REGISTRY="${INPUT_REGISTRY}"
+        export VERSION="${NORMALIZE_VERSION}"
+        # Empty INPUT_PLATFORMS ⇒ defer to docker-bake.hcl (see the build step).
+        if [ -n "${INPUT_PLATFORMS}" ]; then export PLATFORMS="${INPUT_PLATFORMS}"; fi
+
+        # Re-derive the released refs exactly like Promote images did: the repo
+        # from each bake target's canonical tag, retagged to the release tag. The
+        # no-bake Dockerfile path signed a single repo, ${REGISTRY}/${IMAGE_NAME}.
+        if [ "${STRATEGY}" = "dockerfile" ]; then
+          IMAGE_REFS="${REGISTRY}/${IMAGE_NAME}:${NORMALIZE_TAG}"$'\n'
+        else
+          BAKE_OUTPUT=$(docker buildx bake -f "${INPUT_BAKE_FILE}" "${INPUT_BAKE_TARGET}" --print 2>/dev/null)
+          IMAGE_REFS=""
+          while IFS= read -r repo; do
+            [ -n "${repo}" ] && IMAGE_REFS="${IMAGE_REFS}${repo}:${NORMALIZE_TAG}"$'\n'
+          done < <(echo "${BAKE_OUTPUT}" | jq -r '.target[].tags[0] // empty | split(":")[0]' | sort -u)
+        fi
+
+        echo "Released image(s) to sign:"
+        printf '%s' "${IMAGE_REFS}"
+        IMAGE_REFS="${IMAGE_REFS}" "${GITHUB_ACTION_PATH}/scripts/sign-image.sh"
+
+    - name: Attest build provenance (SLSA)
+      if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true' && inputs.image-sign == 'true' && steps.sign-image.outputs.primary_digest != ''
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-name: ${{ steps.sign-image.outputs.primary_subject }}
+        subject-digest: ${{ steps.sign-image.outputs.primary_digest }}
+        push-to-registry: true
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # RELEASE MODE — Native package publishing (opt-in)
+    # ═════════════════════════════════════════════════════════════════════════
+    #
+    # Pack and push a language package (NuGet / pip / npm) to a configurable
+    # feed, using the version diatreme just computed. Opt-in via
+    # `publish-package: true`, gated on `released == 'true'` exactly like
+    # image promotion — so environment/branch logic is inherited: each run
+    # targets one environment and publishes that environment's version
+    # (prereleases on dev/staging, stable on prod; the prerelease state is
+    # carried in the version string, e.g. 1.2.3-rc.1).
+    #
+    # Runs after image promotion and before the GitHub Release is published,
+    # so a downstream `release:published` listener finds the package already
+    # available in the feed — the same race-avoidance ordering used for the
+    # Docker image promote step.
+
+    - name: Set up .NET (package publishing)
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        inputs.package-ecosystem == 'nuget' &&
+        steps.normalize.outputs.released == 'true'
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        dotnet-version: ${{ inputs.dotnet-version }}
+
+    - name: Set up Python (package publishing)
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        inputs.package-ecosystem == 'pip' &&
+        steps.normalize.outputs.released == 'true'
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Set up Node.js (package publishing)
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        inputs.package-ecosystem == 'npm' &&
+        steps.normalize.outputs.released == 'true'
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Set up Java (package publishing)
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        (inputs.package-ecosystem == 'maven' || inputs.package-ecosystem == 'gradle') &&
+        steps.normalize.outputs.released == 'true'
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with:
+        distribution: ${{ inputs.java-distribution }}
+        java-version: ${{ inputs.java-version }}
+
+    - name: Set up Ruby (package publishing)
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        inputs.package-ecosystem == 'rubygems' &&
+        steps.normalize.outputs.released == 'true'
+      uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+      with:
+        ruby-version: ${{ inputs.ruby-version }}
+
+    # No setup step for `container` — docker is preinstalled on the runners; the
+    # script does `docker login`/`build`/`push` directly.
+
+    - name: Publish package
+      id: publish-package
+      if: |
+        inputs.mode == 'release' &&
+        inputs.publish-package == 'true' &&
+        steps.normalize.outputs.released == 'true'
+      shell: bash
+      env:
+        ECOSYSTEM: ${{ inputs.package-ecosystem }}
+        VERSION: ${{ steps.normalize.outputs.version }}
+        # Registry-login token. Defaults to the workflow GITHUB_TOKEN
+        # (resolve-auth-token.sh exposes it as registry-token), which is what
+        # GitHub Packages feeds expect with `packages: write` — independent of
+        # the git/release auth token used for tagging.
+        TOKEN: ${{ inputs.package-token || steps.auth.outputs.registry-token }}
+        FEED_URL: ${{ inputs.package-feed-url }}
+        PACKAGE_PATH: ${{ inputs.package-path }}
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        USERNAME: ${{ inputs.package-username }}
+        OWNER: ${{ github.repository_owner }}
+        REPOSITORY: ${{ github.repository }}
+        PACKAGE_NAME: ${{ inputs.package-name }}
+        IS_PRERELEASE: ${{ steps.detect-env.outputs.is_prerelease }}
+        PRERELEASE_IDENTIFIER: ${{ steps.detect-env.outputs.prerelease_identifier }}
+        NPM_PROVENANCE: ${{ inputs.npm-provenance }}
+        PYPI_TRUSTED_PUBLISHING: ${{ inputs.pypi-trusted-publishing }}
+        AWS_ROLE_TO_ASSUME: ${{ inputs.aws-role-to-assume }}
+      run: "${GITHUB_ACTION_PATH}/scripts/publish-package.sh"
 
     # ═════════════════════════════════════════════════════════════════════════
     # RELEASE MODE — Publish GitHub Release (deferred until after image promote)
@@ -1646,7 +2671,7 @@ runs:
     #
     # Idempotent: a few paths still publish the release inside an
     # external tool we don't control here — the semantic-release-npm
-    # *direct trunk stable* path (the `npx semantic-release` invocation
+    # *direct trunk stable* path (the local `semantic-release` invocation
     # in this very file) and release-please. For those we detect the
     # pre-existing release and emit a notice; the image-vs-release race
     # remains until they're refactored too. python-semantic-release
@@ -1746,6 +2771,7 @@ runs:
         INPUT_ENVIRONMENTS: ${{ inputs.environments }}
         INPUT_PROMOTE_BRANCH_PREFIX: ${{ inputs.promote-branch-prefix }}
         INPUT_PROMOTE_TARGET_BRANCH: ${{ inputs.promote-target-branch }}
+        INPUT_TAG_PREFIX: ${{ inputs.tag-prefix }}
       run: |
         set -euo pipefail
 
@@ -1780,6 +2806,7 @@ runs:
               ENV="${ENV}" NEXT_ENV="${NEXT_ENV}" \
               PRERELEASE_IDENTIFIER="${PRERELEASE_IDENTIFIER}" \
               PROMOTE_BRANCH_PREFIX="${PREFIX}" \
+              TAG_PREFIX="${INPUT_TAG_PREFIX}" \
               "${GITHUB_ACTION_PATH}/scripts/build-promotion-pr-body.sh" > "${out}" 2>/dev/null \
               && [ -s "${out}" ]; then
             echo "Using enriched PR body ($(wc -l < "${out}") lines)."
@@ -1874,6 +2901,7 @@ runs:
         REPO: ${{ github.event.repository.name }}
         TAG: ${{ steps.normalize.outputs.tag }}
         PRERELEASE_IDENTIFIER: ${{ steps.detect-env.outputs.prerelease_identifier }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
       run: "${GITHUB_ACTION_PATH}/scripts/append-github-projects.sh"
 
     # ═════════════════════════════════════════════════════════════════════════
@@ -1942,4 +2970,84 @@ runs:
         TAG: ${{ steps.normalize.outputs.tag }}
         PRERELEASE_IDENTIFIER: ${{ steps.detect-env.outputs.prerelease_identifier }}
         TARGET_STATUS: ${{ inputs.github-projects-target-status }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
       run: "${GITHUB_ACTION_PATH}/scripts/move-github-projects.sh"
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # ENABLE-AUTO-MERGE MODE — turn on native GitHub auto-merge for a PR
+    # ═════════════════════════════════════════════════════════════════════════
+    #
+    # Invoked from a separate caller workflow (typically `pull_request`) to
+    # opt a non-promotion PR into native auto-merge so it lands as soon as
+    # required checks pass and required reviews approve.
+    #
+    # Repo prerequisites (GitHub-side, not enforced by this action):
+    #   - "Allow auto-merge" enabled in Settings → General → Pull Requests
+    #   - Branch protection on the target branch with at least one
+    #     required status check
+    # The helper warns-and-continues if either is missing — the PR is
+    # still mergeable manually.
+
+    - name: Enable auto-merge
+      id: enable-auto-merge
+      if: inputs.mode == 'enable-auto-merge'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ steps.auth.outputs.token }}
+        OWNER: ${{ github.repository_owner }}
+        REPO: ${{ github.event.repository.name }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        MERGE_METHOD: ${{ inputs.auto-merge-method }}
+      run: "${GITHUB_ACTION_PATH}/scripts/enable-auto-merge.sh"
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # ALL MODES — report what the run resolved, where a human will see it
+    # ═════════════════════════════════════════════════════════════════════════
+    #
+    # Everything above writes its decisions to the step log and nowhere else,
+    # spread over ~40 steps most of which are skipped. "What did this release
+    # actually ship?" should not be a scrolling exercise. The job summary is the
+    # one surface GitHub renders at the top of the run page.
+    #
+    # `if: always()` because a failed run is exactly when the question is asked:
+    # whatever was resolved before the failure is still worth showing, and the
+    # reporter cannot fail or change the job's conclusion.
+    #
+    # Every value below is optional to the script — a step that never ran hands
+    # it an empty string, and an empty value drops its row rather than rendering
+    # a blank one. `released` in particular is passed through UNCHANGED: empty
+    # means the run never reached normalisation, which the summary reports as an
+    # incomplete run, not as "nothing to release".
+    - name: Write job summary
+      if: always()
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        # Outcomes, not inputs. This step runs under `if: always()`, so the
+        # facts it was handed are just as present on a run that died as on
+        # one that worked — printing a success line from them alone would
+        # have the summary assert a push, or an enabled auto-merge, that
+        # never happened. `release` mode already keys off `released`.
+        BUILD_OUTCOME: ${{ steps.build-pr-image.outcome }}
+        AUTO_MERGE_OUTCOME: ${{ steps.enable-auto-merge.outcome }}
+        VERSION: ${{ steps.normalize.outputs.version || steps.version-override.outputs.version }}
+        TAG: ${{ steps.normalize.outputs.tag || steps.version-override.outputs.tag }}
+        ENVIRONMENT: ${{ steps.detect-env.outputs.environment }}
+        IS_PRERELEASE: ${{ steps.detect-env.outputs.is_prerelease }}
+        RELEASED: ${{ steps.normalize.outputs.released }}
+        VERSIONING_TOOL: ${{ steps.resolve-tool.outputs.tool }}
+        REGISTRY: ${{ inputs.registry }}
+        OWNER: ${{ github.repository_owner }}
+        IMAGE_NAME: ${{ steps.resolve-image.outputs.image_name }}
+        PR_NUMBER: ${{ inputs.pr-number || github.event.pull_request.number }}
+        IMAGES_PROMOTED: ${{ steps.promote-images.outputs.promoted_count }}
+        IMAGES_SKIPPED: ${{ steps.promote-images.outputs.skipped_count }}
+        IMAGES_REBUILT: ${{ steps.promote-images.outputs.rebuilt_count }}
+        VERSION_FILES_UPDATED: ${{ steps.version-file-inject.outputs.updated_count }}
+        PACKAGE_PUBLISHED: ${{ steps.publish-package.outputs.published }}
+        IMAGE_SCANNED: ${{ steps.scan-image.outputs.scanned }}
+        IMAGE_FINDINGS: ${{ steps.scan-image.outputs.image-findings }}
+        IMAGE_SCAN_SEVERITY: ${{ inputs.image-scan-severity }}
+        IMAGES_SIGNED: ${{ steps.sign-image.outputs.signed_count }}
+        AUTO_MERGE_METHOD: ${{ inputs.auto-merge-method }}
+      run: "${GITHUB_ACTION_PATH}/scripts/write-job-summary.sh"

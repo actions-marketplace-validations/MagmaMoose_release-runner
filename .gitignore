@@ -3,14 +3,49 @@
 __pycache__/
 .idea/
 .vscode/
-dist/
+
+# Node / Cloudflare Worker build artifacts (worker/)
 node_modules/
-worker/.wrangler/
+.wrangler/
+coverage/
+dist/
+*.tsbuildinfo
+
+# MkDocs build output and stray logs
+site/
+*.log
+
+# Local secrets must never be committed.
+.env
+.env.*
+.dev.vars
+.dev.vars.local
 
 # Syncthing leaves these when two devices edit the same file.
 # They must never be staged — the content is older than whatever
 # is already on disk.
 *.sync-conflict-*
 
-# Claude Code session state
-.claude/
+# Claude Code: keep local/session state out of Git, but TRACK the shared
+# context-optimization stack so future sessions and fresh clones inherit it.
+.claude/*
+!.claude/ARCHITECTURE_MAP.md
+!.claude/COMMON_MISTAKES.md
+!.claude/INFRA_NOTES.md
+!.claude/QUICK_START.md
+!.claude/settings.json
+!.claude/decisions/
+!.claude/sessions/
+# Personal / machine-local Claude state stays untracked.
+.claude/settings.local.json
+.claude/last_output.txt
+# Session summaries are local running notes — track only the template.
+.claude/sessions/*
+!.claude/sessions/TEMPLATE.md
+
+# Python broker (broker/)
+broker/dist/
+broker/.venv/
+broker/**/__pycache__/
+broker/.pytest_cache/
+broker/.ruff_cache/

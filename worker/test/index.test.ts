@@ -1,10 +1,11 @@
-import { handleRequest, type BrokerEnv } from "../src/index";
+import { handleRequest, parseAudience, type BrokerEnv } from "../src/index";
 import { generateKeyPairSync } from "node:crypto";
+import { SignJWT, generateKeyPair } from "jose";
 
 const env: BrokerEnv = {
   GITHUB_APP_ID: "12345",
   GITHUB_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----\\nsecret\\n-----END PRIVATE KEY-----",
-  OIDC_AUDIENCE: "release-runner"
+  OIDC_AUDIENCE: "diatreme"
 };
 
 function tokenRequest(body: Record<string, unknown>): Request {
@@ -25,6 +26,7 @@ function deps(options: {
   repository?: string;
   githubResponses?: Response[];
   verifyThrows?: boolean;
+  iss?: string;
 } = {}) {
   const calls: Request[] = [];
   const githubResponses = [...(options.githubResponses ?? [])];
@@ -37,7 +39,8 @@ function deps(options: {
           throw new Error("bad oidc");
         }
         return {
-          repository: options.repository ?? "octo-org/octo-repo"
+          repository: options.repository ?? "octo-org/octo-repo",
+          ...(options.iss ? { iss: options.iss } : {})
         };
       },
       createGitHubAppJwt: async () => "app.jwt",
@@ -71,7 +74,12 @@ describe("token broker", () => {
     );
 
     expect(response.status).toBe(401);
-    expect(await readJson(response)).toEqual({ error: "invalid_oidc_token" });
+    // The fake dep throws a plain Error with no jose `code`, so the reason is
+    // "unknown" — the `error` string itself is unchanged for existing callers.
+    expect(await readJson(response)).toEqual({
+      error: "invalid_oidc_token",
+      reason: "unknown"
+    });
   });
 
   it("rejects repo claim mismatch with 403", async () => {
@@ -187,6 +195,84 @@ describe("token broker", () => {
     });
   });
 
+  const GHE_ENV: BrokerEnv = {
+    ...env,
+    GHE_OIDC_ISSUER: "https://token.actions.acme.ghe.com",
+    GHE_API_BASE: "https://acme.ghe.com/api/v3",
+    GHE_GITHUB_APP_ID: "99",
+    GHE_GITHUB_APP_PRIVATE_KEY:
+      "-----BEGIN PRIVATE KEY-----\\nghe\\n-----END PRIVATE KEY-----"
+  };
+
+  it("mints a GHE token against the GHE API base when the issuer is the GHE tenant", async () => {
+    const { calls, deps: injected } = deps({
+      iss: "https://token.actions.acme.ghe.com",
+      githubResponses: [
+        Response.json({ id: 7 }),
+        Response.json({ token: "ghe-token", expires_at: "2026-05-03T13:00:00Z" })
+      ]
+    });
+    const response = await handleRequest(
+      tokenRequest({ oidcToken: "valid.jwt", owner: "octo-org", repo: "octo-repo" }),
+      GHE_ENV,
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      token: "ghe-token",
+      expires_at: "2026-05-03T13:00:00Z",
+      repository: "octo-org/octo-repo"
+    });
+    // Both GitHub calls hit the GHE REST API, never api.github.com.
+    expect(calls[0].url).toBe(
+      "https://acme.ghe.com/api/v3/repos/octo-org/octo-repo/installation"
+    );
+    expect(calls[1].url).toBe(
+      "https://acme.ghe.com/api/v3/app/installations/7/access_tokens"
+    );
+  });
+
+  it("skips the GHE installation lookup when GHE_GITHUB_APP_INSTALLATION_ID is set", async () => {
+    const { calls, deps: injected } = deps({
+      iss: "https://token.actions.acme.ghe.com",
+      githubResponses: [
+        Response.json({ token: "ghe-token", expires_at: "2026-05-03T13:00:00Z" })
+      ]
+    });
+    const response = await handleRequest(
+      tokenRequest({ oidcToken: "valid.jwt", owner: "octo-org", repo: "octo-repo" }),
+      { ...GHE_ENV, GHE_GITHUB_APP_INSTALLATION_ID: "555" },
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    // Only the token-create call is made; the per-repo lookup is skipped.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(
+      "https://acme.ghe.com/api/v3/app/installations/555/access_tokens"
+    );
+  });
+
+  it("still mints via github.com for tokens whose issuer is not the GHE tenant", async () => {
+    const { calls, deps: injected } = deps({
+      githubResponses: [
+        Response.json({ id: 42 }),
+        Response.json({ token: "dotcom-token", expires_at: "2026-05-03T13:00:00Z" })
+      ]
+    });
+    const response = await handleRequest(
+      tokenRequest({ oidcToken: "valid.jwt", owner: "octo-org", repo: "octo-repo" }),
+      GHE_ENV, // GHE configured, but this token carries no GHE issuer
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls[0].url).toBe(
+      "https://api.github.com/repos/octo-org/octo-repo/installation"
+    );
+  });
+
   it("accepts GitHub-style PKCS#1 RSA private keys", async () => {
     const { privateKey } = generateKeyPairSync("rsa", {
       modulusLength: 2048
@@ -224,5 +310,661 @@ describe("token broker", () => {
     );
 
     expect(response.status).toBe(200);
+  });
+});
+
+// ─── shared helpers ──────────────────────────────────────────────────────────
+//
+// Tests run the worker through `handleRequest` with injected `fetch` / `now`,
+// the same shape the /token tests use. The KV namespace is faked with an
+// in-memory Map so we don't pull in miniflare just for these cases.
+
+function makeKv() {
+  const store = new Map<string, { value: string; expiresAt?: number }>();
+  return {
+    store,
+    kv: {
+      async get(key: string) {
+        const entry = store.get(key);
+        if (!entry) return null;
+        if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+          store.delete(key);
+          return null;
+        }
+        return entry.value;
+      },
+      async put(
+        key: string,
+        value: string,
+        options?: { expirationTtl?: number }
+      ) {
+        const expiresAt = options?.expirationTtl
+          ? Date.now() + options.expirationTtl * 1000
+          : undefined;
+        store.set(key, { value, expiresAt });
+      },
+      async delete(key: string) {
+        store.delete(key);
+      },
+      async list(options?: { prefix?: string; cursor?: string }) {
+        const prefix = options?.prefix ?? "";
+        const keys = [...store.keys()]
+          .filter((name) => name.startsWith(prefix))
+          .map((name) => ({ name }));
+        return { keys, list_complete: true };
+      },
+      async getWithMetadata(_key: string) {
+        return { value: null, metadata: null };
+      }
+    } as unknown as KVNamespace
+  };
+}
+
+async function hmac(secret: string, body: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(body)
+  );
+  return (
+    "sha256=" +
+    Array.from(new Uint8Array(mac))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+  );
+}
+
+// ─── /webhook signature gate + non-push no-op ────────────────────────────────
+
+describe("/webhook", () => {
+  it("rejects requests when no webhook secret is configured", async () => {
+    const response = await handleRequest(
+      new Request("https://broker.example.com/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-event": "ping",
+          "x-hub-signature-256": "sha256=abc"
+        },
+        body: "{}"
+      }),
+      env
+    );
+    expect(response.status).toBe(503);
+    expect(await readJson(response)).toEqual({ error: "webhook_disabled" });
+  });
+
+  it("rejects requests with an invalid HMAC signature", async () => {
+    const response = await handleRequest(
+      new Request("https://broker.example.com/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-event": "ping",
+          "x-hub-signature-256": "sha256=deadbeef"
+        },
+        body: JSON.stringify({ zen: "hi" })
+      }),
+      { ...env, GITHUB_WEBHOOK_SECRET: "shh" }
+    );
+    expect(response.status).toBe(401);
+    expect(await readJson(response)).toEqual({ error: "invalid_signature" });
+  });
+
+  it("acknowledges non-push events as a no-op", async () => {
+    const body = JSON.stringify({ zen: "hi" });
+    const sig = await hmac("shh", body);
+    const response = await handleRequest(
+      new Request("https://broker.example.com/webhook", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-github-event": "ping",
+          "x-hub-signature-256": sig
+        },
+        body
+      }),
+      { ...env, GITHUB_WEBHOOK_SECRET: "shh" }
+    );
+    expect(response.status).toBe(200);
+    const out = await readJson(response);
+    expect(out.ok).toBe(true);
+    expect(out.ignored).toBe("ping");
+  });
+
+  it("returns 404 for unknown paths", async () => {
+    const response = await handleRequest(
+      new Request("https://broker.example.com/whatever", { method: "GET" }),
+      env
+    );
+    expect(response.status).toBe(404);
+  });
+});
+
+// ─── auto-update branches (push webhook) ─────────────────────────────────────
+
+function pushRequest(body: Record<string, unknown>, sig: string): Request {
+  return new Request("https://broker.example.com/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-github-event": "push",
+      "x-hub-signature-256": sig
+    },
+    body: JSON.stringify(body)
+  });
+}
+
+const pushEnv: BrokerEnv = {
+  ...env,
+  GITHUB_WEBHOOK_SECRET: "shh",
+  AUTO_UPDATE_BRANCHES: "true"
+};
+
+const pushPayload = {
+  ref: "refs/heads/main",
+  repository: { name: "octo-repo", owner: { login: "octo-org" } }
+};
+
+describe("auto-update branches (push webhook)", () => {
+  it("does nothing when AUTO_UPDATE_BRANCHES is unset", async () => {
+    const body = JSON.stringify(pushPayload);
+    const sig = await hmac("shh", body);
+    const { deps: injected } = deps();
+    injected.fetch = async () => {
+      throw new Error("should not call GitHub when disabled");
+    };
+    const response = await handleRequest(
+      pushRequest(pushPayload, sig),
+      { ...env, GITHUB_WEBHOOK_SECRET: "shh" },
+      injected
+    );
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      ok: true,
+      auto_update: "disabled"
+    });
+  });
+
+  it("ignores tag pushes", async () => {
+    const payload = { ...pushPayload, ref: "refs/tags/v1.2.3" };
+    const body = JSON.stringify(payload);
+    const sig = await hmac("shh", body);
+    const { deps: injected } = deps();
+    injected.fetch = async () => {
+      throw new Error("should not call GitHub for tags");
+    };
+    const response = await handleRequest(
+      pushRequest(payload, sig),
+      pushEnv,
+      injected
+    );
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      ok: true,
+      ignored_ref: "refs/tags/v1.2.3"
+    });
+  });
+
+  it("ignores branch deletions", async () => {
+    const payload = { ...pushPayload, deleted: true };
+    const body = JSON.stringify(payload);
+    const sig = await hmac("shh", body);
+    const { deps: injected } = deps();
+    injected.fetch = async () => {
+      throw new Error("should not call GitHub on delete");
+    };
+    const response = await handleRequest(
+      pushRequest(payload, sig),
+      pushEnv,
+      injected
+    );
+    expect(await readJson(response)).toEqual({ ok: true, branch_deleted: true });
+  });
+
+  it("updates every open PR targeting the pushed branch", async () => {
+    const { calls, deps: injected } = deps({
+      githubResponses: [
+        Response.json({ id: 42 }), // installation lookup
+        Response.json({ token: "ghs_x", expires_at: "2026-05-03T13:00:00Z" }),
+        Response.json([{ number: 1 }, { number: 2 }]), // open PRs
+        new Response("{}", { status: 202 }), // update PR #1
+        new Response("{}", { status: 202 }) // update PR #2
+      ]
+    });
+    const body = JSON.stringify(pushPayload);
+    const sig = await hmac("shh", body);
+    const response = await handleRequest(
+      pushRequest(pushPayload, sig),
+      pushEnv,
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      ok: true,
+      branch: "main",
+      updated: [1, 2],
+      skipped: []
+    });
+
+    // PR list query targets the pushed base branch.
+    expect(calls[2].url).toContain("state=open");
+    expect(calls[2].url).toContain("base=main");
+    // update-branch PUT per PR.
+    expect(calls[3].method).toBe("PUT");
+    expect(calls[3].url).toContain("/pulls/1/update-branch");
+    expect(calls[4].url).toContain("/pulls/2/update-branch");
+  });
+
+  it("records PRs that can't be fast-forwarded as skipped", async () => {
+    const { deps: injected } = deps({
+      githubResponses: [
+        Response.json({ id: 42 }),
+        Response.json({ token: "ghs_x", expires_at: "2026-05-03T13:00:00Z" }),
+        Response.json([{ number: 5 }]),
+        new Response('{"message":"merge conflict"}', { status: 422 })
+      ]
+    });
+    const body = JSON.stringify(pushPayload);
+    const sig = await hmac("shh", body);
+    const response = await handleRequest(
+      pushRequest(pushPayload, sig),
+      pushEnv,
+      injected
+    );
+
+    expect(await readJson(response)).toEqual({
+      ok: true,
+      branch: "main",
+      updated: [],
+      skipped: [{ number: 5, reason: "not_updatable" }]
+    });
+  });
+
+  it("acknowledges (200) with an error code when the app is not installed", async () => {
+    const { deps: injected } = deps({
+      githubResponses: [new Response("{}", { status: 404 })]
+    });
+    const body = JSON.stringify(pushPayload);
+    const sig = await hmac("shh", body);
+    const response = await handleRequest(
+      pushRequest(pushPayload, sig),
+      pushEnv,
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    expect(await readJson(response)).toEqual({
+      ok: true,
+      branch: "main",
+      error: "app_not_installed"
+    });
+  });
+});
+
+// ─── GET /releases ───────────────────────────────────────────────────────────
+
+function releasesRequest(headers: Record<string, string> = {}): Request {
+  return new Request("https://broker.example.com/releases", {
+    method: "GET",
+    headers
+  });
+}
+
+describe("GET /releases", () => {
+  it("is disabled (503) when PROCESS_TRIGGER_SECRET is unset", async () => {
+    const response = await handleRequest(releasesRequest(), env);
+    expect(response.status).toBe(503);
+    expect(await readJson(response)).toEqual({ error: "releases_disabled" });
+  });
+
+  it("rejects a wrong bearer with 401", async () => {
+    const response = await handleRequest(
+      releasesRequest({ authorization: "Bearer nope" }),
+      { ...env, PROCESS_TRIGGER_SECRET: "trigger" }
+    );
+    expect(response.status).toBe(401);
+    expect(await readJson(response)).toEqual({ error: "unauthorized" });
+  });
+
+  it("aggregates the latest release across the App's installed repos", async () => {
+    const { deps: injected } = deps({
+      githubResponses: [
+        Response.json([{ id: 42 }]), // GET /app/installations
+        Response.json({ token: "ghs_x", expires_at: "2026-05-29T13:00:00Z" }), // access_tokens
+        Response.json({
+          repositories: [
+            { full_name: "octo/repo-a" },
+            { full_name: "octo/repo-b" }
+          ]
+        }), // /installation/repositories
+        Response.json({
+          tag_name: "v1.2.0",
+          name: "1.2.0",
+          published_at: "2026-05-20T10:00:00Z",
+          html_url: "https://github.com/octo/repo-a/releases/tag/v1.2.0",
+          draft: false,
+          prerelease: false
+        }), // repo-a latest
+        new Response("{}", { status: 404 }) // repo-b: no releases
+      ]
+    });
+
+    const response = await handleRequest(
+      releasesRequest({ authorization: "Bearer trigger" }),
+      { ...env, PROCESS_TRIGGER_SECRET: "trigger" },
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    const body = await readJson(response);
+    expect(body.cached).toBe(false);
+    expect(body.truncated).toBe(false);
+    const repos = body.repos as Array<Record<string, unknown>>;
+    expect(repos).toHaveLength(2);
+    // repo-a (has a release) sorts ahead of repo-b (none)
+    expect(repos[0].repo).toBe("octo/repo-a");
+    expect((repos[0].latest as Record<string, unknown>).tag).toBe("v1.2.0");
+    expect(repos[1].repo).toBe("octo/repo-b");
+    expect(repos[1].latest).toBeNull();
+  });
+
+  it("serves a warm KV cache without re-hitting GitHub", async () => {
+    const { kv, store } = makeKv();
+    store.set("releases:aggregate", {
+      value: JSON.stringify({
+        generated_at: "2026-05-29T12:00:00Z",
+        repos: [{ repo: "octo/cached", latest: null }],
+        truncated: false
+      })
+    });
+    const { deps: injected } = deps();
+    injected.fetch = async () => {
+      throw new Error("should not hit GitHub when cache is warm");
+    };
+
+    const response = await handleRequest(
+      releasesRequest({ authorization: "Bearer trigger" }),
+      { ...env, PROCESS_TRIGGER_SECRET: "trigger", COPILOT_QUOTA_KV: kv },
+      injected
+    );
+
+    expect(response.status).toBe(200);
+    const body = await readJson(response);
+    expect(body.cached).toBe(true);
+    expect((body.repos as unknown[])[0]).toEqual({ repo: "octo/cached", latest: null });
+  });
+});
+
+// ─── POST /sign (GitHub-signed, App/bot-attributed commit) ───────────────────
+
+describe("POST /sign", () => {
+  const signEnv: BrokerEnv = {
+    ...env,
+    PROCESS_TRIGGER_SECRET: "trig"
+  };
+  const body = {
+    user: "caleb", // accepted but ignored — kept for backward compatibility
+    repo: "octo/repo",
+    branch: "feature",
+    expected_head_oid: "abc123",
+    message: { headline: "fix: thing" },
+    additions: [{ path: "a.ts", contents: "Y29uc3Q=" }]
+  };
+  function signReq(headers: Record<string, string> = { authorization: "Bearer trig" }): Request {
+    return new Request("https://broker.example.com/sign", {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body)
+    });
+  }
+
+  it("is disabled (503) without PROCESS_TRIGGER_SECRET", async () => {
+    const r = await handleRequest(signReq({}), env);
+    expect(r.status).toBe(503);
+    expect(await readJson(r)).toEqual({ error: "sign_disabled" });
+  });
+
+  it("rejects a wrong bearer with 401", async () => {
+    const { deps: injected } = deps();
+    const r = await handleRequest(
+      signReq({ authorization: "Bearer nope" }),
+      signEnv,
+      injected
+    );
+    expect(r.status).toBe(401);
+    expect(await readJson(r)).toEqual({ error: "unauthorized" });
+  });
+
+  it("creates a GitHub-signed, App-attributed commit via createCommitOnBranch", async () => {
+    const { calls, deps: injected } = deps({
+      githubResponses: [
+        // mintInstallationToken: installation lookup, then access_tokens mint
+        Response.json({ id: 42 }),
+        Response.json({ token: "ghs_app", expires_at: "2026-05-03T13:00:00Z" }),
+        // GraphQL createCommitOnBranch
+        Response.json({
+          data: {
+            createCommitOnBranch: {
+              commit: { oid: "deadbeef", url: "https://github.com/octo/repo/commit/deadbeef" }
+            }
+          }
+        })
+      ]
+    });
+    const r = await handleRequest(signReq(), signEnv, injected);
+    expect(r.status).toBe(200);
+    expect((await readJson(r)).commit).toEqual({
+      oid: "deadbeef",
+      url: "https://github.com/octo/repo/commit/deadbeef"
+    });
+    // First two calls mint the App installation token for the repo.
+    expect(calls[0].url).toBe(
+      "https://api.github.com/repos/octo/repo/installation"
+    );
+    expect(calls[1].url).toBe(
+      "https://api.github.com/app/installations/42/access_tokens"
+    );
+    const tokenBody = (await calls[1].json()) as Record<string, unknown>;
+    expect(tokenBody).toEqual({ repositories: ["repo"], permissions: { contents: "write" } });
+    // The commit is signed with the App installation token, not a user token.
+    expect(calls[2].url).toContain("/graphql");
+    expect(calls[2].headers.get("authorization")).toBe("Bearer ghs_app");
+  });
+
+  it("surfaces an HttpError from token minting (404 app_not_installed)", async () => {
+    const { deps: injected } = deps({
+      githubResponses: [new Response("{}", { status: 404 })] // installation lookup 404s
+    });
+    const r = await handleRequest(signReq(), signEnv, injected);
+    expect(r.status).toBe(404);
+    expect(await readJson(r)).toEqual({ error: "app_not_installed" });
+  });
+});
+
+// ─── OIDC failure diagnosability (issue #147) ────────────────────────────────
+// Before this, every verification failure — a forged token, a wrong audience, an
+// expired token, and GitHub's JWKS being unreachable — collapsed into one opaque
+// `401 invalid_oidc_token` with nothing logged, so an incident could not be told
+// apart from a bad token. Each failure now carries a coarse `reason` and emits one
+// structured log line.
+
+function throwingVerify(code: string, extra: Record<string, unknown> = {}) {
+  return {
+    verifyOidcToken: async () => {
+      throw Object.assign(new Error("boom"), { code, ...extra });
+    }
+  };
+}
+
+// A distinctive signature segment so the "never logs the token" assertion is real
+// rather than vacuous.
+function oidcRequest(): Request {
+  return tokenRequest({
+    oidcToken: "header.payload.signature-do-not-log",
+    owner: "octo-org",
+    repo: "octo-repo"
+  });
+}
+
+describe("OIDC failure classification", () => {
+  it.each([
+    ["ERR_JWKS_NO_MATCHING_KEY", {}, "kid_not_found"],
+    ["ERR_JWKS_MULTIPLE_MATCHING_KEYS", {}, "key_ambiguous"],
+    ["ERR_JWS_SIGNATURE_VERIFICATION_FAILED", {}, "signature_invalid"],
+    ["ERR_JWT_EXPIRED", {}, "token_expired"],
+    ["ERR_JWT_CLAIM_VALIDATION_FAILED", { claim: "aud" }, "audience_mismatch"],
+    ["ERR_JWT_CLAIM_VALIDATION_FAILED", { claim: "iss" }, "issuer_mismatch"],
+    ["ERR_JWT_CLAIM_VALIDATION_FAILED", { claim: "nbf" }, "token_not_yet_valid"],
+    ["ERR_JWT_CLAIM_VALIDATION_FAILED", { claim: "sub" }, "claim_invalid"],
+    ["ERR_JWT_INVALID", {}, "malformed_token"]
+  ])("maps %s to a 401 with reason %s", async (code, extra, reason) => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const response = await handleRequest(
+      oidcRequest(),
+      env,
+      throwingVerify(code as string, extra as Record<string, unknown>)
+    );
+    warn.mockRestore();
+
+    expect(response.status).toBe(401);
+    expect(await readJson(response)).toEqual({
+      error: "invalid_oidc_token",
+      reason
+    });
+  });
+
+  it.each(["ERR_JWKS_TIMEOUT", "ERR_JWKS_INVALID", "ERR_JOSE_GENERIC"])(
+    "reports %s as 503 — our key retrieval failed, the caller's token did not",
+    async (code) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const response = await handleRequest(oidcRequest(), env, throwingVerify(code));
+      warn.mockRestore();
+
+      expect(response.status).toBe(503);
+      expect(await readJson(response)).toEqual({
+        error: "oidc_key_fetch_failed",
+        reason: "jwks_unavailable"
+      });
+    }
+  );
+
+  it("treats a bare TypeError from the JWKS subrequest as unavailability", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const response = await handleRequest(oidcRequest(), env, {
+      verifyOidcToken: async () => {
+        throw new TypeError("network error");
+      }
+    });
+    warn.mockRestore();
+
+    expect(response.status).toBe(503);
+  });
+
+  it("logs one structured line per failure and never logs the token", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await handleRequest(oidcRequest(), env, throwingVerify("ERR_JWT_EXPIRED"));
+
+    expect(warn).toHaveBeenCalledTimes(1);
+    const line = warn.mock.calls[0][0] as Record<string, unknown>;
+    expect(line.event).toBe("oidc_verify_failed");
+    expect(line.reason).toBe("token_expired");
+    expect(line.errCode).toBe("ERR_JWT_EXPIRED");
+    expect(line.expectedAudience).toBe("diatreme");
+    expect(line.trustedIssuers).toBe("https://token.actions.githubusercontent.com");
+    // The fixture token is not a real JWT, so the claim block is absent — but the
+    // line is still emitted, which is the point.
+    expect(line.decodable).toBe("false");
+    expect(JSON.stringify(warn.mock.calls)).not.toContain("signature-do-not-log");
+    warn.mockRestore();
+  });
+
+  it("logs the decoded claims of a real token without logging the token", async () => {
+    // The case above uses a token that is not a decodable JWT, so it never reaches
+    // logOidcFailure's claim block — which is exactly the part that handles
+    // attacker-controlled data. Mint a real one so the redaction guarantee is
+    // actually exercised.
+    const pair = await generateKeyPair("RS256", { extractable: true });
+    const token = await new SignJWT({ repository: "octo-org/octo-repo" })
+      .setProtectedHeader({ alg: "RS256", kid: "test-kid-abc123" })
+      .setIssuer("https://token.actions.githubusercontent.com")
+      .setAudience("diatreme")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(pair.privateKey);
+    const signature = token.slice(token.lastIndexOf(".") + 1);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await handleRequest(
+      tokenRequest({ oidcToken: token, owner: "octo-org", repo: "octo-repo" }),
+      env,
+      throwingVerify("ERR_JWT_EXPIRED")
+    );
+    const line = warn.mock.calls[0][0] as Record<string, unknown>;
+    const logged = JSON.stringify(warn.mock.calls);
+    warn.mockRestore();
+
+    expect(line.decodable).toBe("true");
+    expect(line.headerKid).toBe("test-kid-abc123");
+    expect(line.headerAlg).toBe("RS256");
+    expect(line.claimIss).toBe("https://token.actions.githubusercontent.com");
+    expect(line.claimAud).toBe("diatreme");
+    expect(line.claimRepository).toBe("octo-org/octo-repo");
+    expect(line.claimExp).toBeDefined();
+    // The whole point: enough to diagnose, never the credential itself.
+    expect(logged).not.toContain(token);
+    expect(logged).not.toContain(signature);
+  });
+
+  it("truncates attacker-controlled claim values so a hostile token cannot flood the log", async () => {
+    const pair = await generateKeyPair("RS256", { extractable: true });
+    const token = await new SignJWT({ repository: "x".repeat(5000) })
+      .setProtectedHeader({ alg: "RS256", kid: "k".repeat(5000) })
+      .setIssuer("https://token.actions.githubusercontent.com")
+      .setAudience("diatreme")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(pair.privateKey);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await handleRequest(
+      tokenRequest({ oidcToken: token, owner: "octo-org", repo: "octo-repo" }),
+      env,
+      throwingVerify("ERR_JWT_EXPIRED")
+    );
+    const line = warn.mock.calls[0][0] as Record<string, unknown>;
+    warn.mockRestore();
+
+    expect((line.headerKid as string).length).toBe(128);
+    expect((line.claimRepository as string).length).toBe(128);
+  });
+});
+
+describe("parseAudience", () => {
+  it.each([undefined, "", "   ", ",  ,"])(
+    "falls back to the defaults for %o instead of an unmatchable audience",
+    (configured) => {
+      expect(parseAudience(configured)).toEqual(["diatreme", "release-runner"]);
+    }
+  );
+
+  it("trims a configured audience", () => {
+    expect(parseAudience("diatreme\n")).toEqual(["diatreme"]);
+    expect(parseAudience(" diatreme ")).toEqual(["diatreme"]);
+  });
+
+  it("accepts a comma-separated list", () => {
+    expect(parseAudience("diatreme, release-runner")).toEqual([
+      "diatreme",
+      "release-runner"
+    ]);
   });
 });

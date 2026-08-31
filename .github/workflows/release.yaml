@@ -1,11 +1,18 @@
 name: Release
 
-# Versions the tbd-release action itself using semantic-release.
+# Versions the Diatreme Marketplace action itself using semantic-release.
 # Creates GitHub Releases (v1.0.0, v1.1.0, etc.) that callers pin to.
 # Keeps the floating major action tag (v1, v2, etc.) pointing at the latest
 # stable release so Marketplace examples can pin to the major version.
+#
+# The job is named `diatreme` so it reports the org-required `diatreme`
+# status check. diatreme keeps this BESPOKE release (dogfoods `uses: ./` and
+# maintains the major tag) instead of Caldrith's managed release.yml, which
+# runs the published action — diatreme must release with its own code. On
+# pull_request the job no-ops; the real release runs only on push to main.
 
 on:
+  pull_request:
   push:
     branches: [main]
     paths-ignore:
@@ -14,16 +21,30 @@ on:
       - 'CHANGELOG.md'
       - 'LICENSE'
 
+# Serialize releases: never let two pushes to main cut a release concurrently
+# (the release mints tags and moves the floating major tag). Do NOT cancel an
+# in-flight release — a second push queues behind it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  diatreme:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: PR no-op
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "No release on pull requests (the action is validated by ci.yaml)."
+          echo "This job reports the org-required diatreme check; release runs on push to main."
 
       - id: release
+        if: github.event_name != 'pull_request'
         uses: ./
         with:
           mode: release
@@ -31,13 +52,13 @@ jobs:
           environments: '["prod"]'
           prerelease-identifiers: '{}'
 
-      - name: Request Release Runner token for major tag
+      - name: Request Diatreme token for major tag
         id: major-token
-        if: steps.release.outputs.released == 'true' && !contains(steps.release.outputs.version, '-')
+        if: github.event_name != 'pull_request' && steps.release.outputs.released == 'true' && !contains(steps.release.outputs.version, '-')
         run: ./scripts/request-public-app-token.sh
 
       - name: Update major action tag
-        if: steps.release.outputs.released == 'true' && !contains(steps.release.outputs.version, '-')
+        if: github.event_name != 'pull_request' && steps.release.outputs.released == 'true' && !contains(steps.release.outputs.version, '-')
         env:
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}

@@ -1,20 +1,22 @@
 {
-  "name": "@calebsargeant/release-runner",
+  "name": "@calebsargeant/diatreme",
   "private": true,
   "type": "module",
   "scripts": {
     "check": "npm run typecheck && npm test && npx wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "coverage": "vitest run --coverage --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=cobertura --coverage.reportsDirectory=coverage",
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "jose": "^6.2.3"
+    "jose": "6.2.10"
   },
   "devDependencies": {
-    "@types/node": "^25.7.0",
-    "typescript": "^6.0.3",
-    "vitest": "^4.1.6",
-    "wrangler": "^4.90.0"
+    "@types/node": "26.2.0",
+    "@vitest/coverage-v8": "4.1.11",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.125.0"
   }
 }

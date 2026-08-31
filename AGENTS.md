@@ -1,122 +1,94 @@
 # AGENTS.md
 
-This file provides guidance to AI coding agents (GitHub Copilot, Warp AI, etc.) when working with code in this repository.
+This repository is **Diatreme**: a GitHub Marketplace composite action plus the
+Cloudflare Worker that backs it. It has two independent surfaces in one repo:
 
-## Repository purpose
-This repo publishes a composite GitHub Action (`action.yml`) that orchestrates semantic releases for TBD/BBD workflows and optionally promotes Docker images in GHCR.  
-It also contains a Cloudflare Worker (`worker/`) used as a token broker for the public GitHub App auth mode.
+| Surface | Path | Toolchain |
+| --- | --- | --- |
+| Composite action (Marketplace) | `action.yml` + `scripts/*.sh` | Bash, `actionlint`, `shellcheck`, `bats` |
+| Cloudflare Worker (backend service) | `worker/` | TypeScript, `wrangler`, `vitest` |
 
-## Core development commands
-Run from repository root unless noted.
+The action is published to the Marketplace from the repo root (exactly one
+`action.yml`). The worker is deployed to Cloudflare from `worker/`. They
+communicate over HTTP (the action calls the worker at
+`api.diatreme.magmamoose.com`), and neither imports the other.
 
-- Install JS dependencies (root + `worker/` workspace):
-  - `npm ci`
-- Full local validation (matches CI intent):
-  - `npm run ci`
-- Action/shell/docs checks individually:
-  - `npm run lint:actions`
-  - `npm run lint:markdown`
-  - `npm run test:bake`
-  - `npm run test:shell`
-  - `npm run worker:check`
+## Repository Boundary
 
-### Targeted test commands
-- Run only Bats tests for auth-token script:
-  - `bats tests/bats/resolve-auth-token.bats`
-- Run one Bats test by name:
-  - `bats tests/bats/resolve-auth-token.bats -f "github-token mode uses default workflow token"`
-- Run worker tests only:
-  - `npm run test:worker`
-- Run one worker test file:
-  - `npm --workspace worker test -- test/index.test.ts`
-- Run worker test(s) by name:
-  - `npm --workspace worker test -- -t "creates a repo-scoped installation token"`
+- Keep exactly one root action metadata file: `action.yml` (or `action.yaml`).
+- The worker is self-contained under `worker/`; its only runtime dependency is
+  `jose`. Do not couple it to the action scripts or to any external/monorepo
+  package.
+- The proprietary observability dashboard for this worker lives in the separate
+  private repo `MagmaMoose/diatreme-pro`. Do not copy that code here.
 
-### Worker-specific commands
-- Typecheck worker:
-  - `npm run typecheck:worker`
-- Worker check pipeline (typecheck + tests + wrangler dry-run deploy):
-  - `npm run worker:check`
-- Deploy broker worker (requires Cloudflare auth/secrets), from repo root:
-  - `npm --workspace worker run deploy`
+## Required Files
 
-### Docs commands
-- Regenerate action input/output reference from `action.yml`:
-  - `python scripts/generate-action-reference.py`
-  - The generator groups inputs into sections (Core, Versioning tool, Deployment model, Authentication, Docker, CI checks, GitVersion, release-please) and renders enumerated values as Markdown tables.
-  - When adding or renaming an input in `action.yml`, also add it to the `INPUT_GROUPS` list in the generator script so it appears in the correct section.
-- Build docs site locally:
-  - `python -m pip install -r requirements-docs.txt`
-  - `mkdocs build --strict`
+Action surface:
+- `action.yml`: published composite action metadata and inline orchestration.
+- `scripts/*.sh`: runtime helpers called by `action.yml`.
+- `README.md`: Marketplace user guide (usage, inputs, outputs, permissions, examples).
+- `CHANGELOG.md`, `LICENSE`, `pyproject.toml`: release metadata for the action.
+- `.github/workflows/ci.yaml`: validates both surfaces.
+- `.github/workflows/release.yaml`: publishes the action and updates floating major tags.
 
-## High-level architecture
-### 1) Composite action pipeline (`action.yml`)
-`action.yml` is the product. The action has two runtime branches:
+Worker surface:
+- `worker/src/index.ts`: the Worker entry (`default.fetch` request router).
+- `worker/README.md`: endpoint and configuration reference.
+- `worker/wrangler.jsonc`: Cloudflare deploy config.
+- `worker/test/index.test.ts`: vitest suite.
 
-- `mode: ci`
-  - Optional branch-name enforcement via `scripts/check-branch-naming.sh`.
-  - Docker Buildx build/push of `pr-<number>` tags.
-  - Multi-target bake groups are expanded via `docker buildx bake --print`, then built with per-target cache scopes.
+## Local Validation
 
-- `mode: release`
-  - Auth token is resolved first (`scripts/request-public-app-token.sh` + `scripts/resolve-auth-token.sh`).
-  - Environment resolution (`tbd`, `tbd-pr`, `bbd`) computes prerelease/stable behavior.
-  - Versioning is delegated to one selected tool:
-    - `python-semantic-release`
-    - `semantic-release` (npm)
-    - `GitVersion`
-    - `release-please`
-  - Outputs are normalized into common `version`, `tag`, `released`, etc.
-  - If Docker is enabled and a release was produced, image promotion runs:
-    - Primary retag: `docker buildx imagetools create` (preserves multi-arch).
-    - Referrers-index fallback: `docker pull/tag/push` when imagetools fails
-      with the GHE Packages referrers parse error (single-arch only on this path).
-    - Fresh-build fallback: `buildx bake --push` when both retag paths fail.
-  - Optional `tbd-pr` promotion PR creation writes a marker file under `.github/promotions/` and opens the next env PR.
+Action (from repo root):
 
-- Repository release publication flows:
-  - `.github/workflows/release.yaml` self-releases this action via `uses: ./` (prod-only environment), then force-updates the floating major tag (`v1`, `v2`, ...) using a broker token from `scripts/request-public-app-token.sh`.
+```bash
+ruby -e 'require "yaml"; YAML.load_file("action.yml")'
+actionlint -color=false
+shellcheck -S warning scripts/*.sh
+bats tests/bats
+```
 
-### 2) Auth/token model
-- `scripts/resolve-auth-token.sh` is the single token-selection gate used by the action:
-  - Chooses among `public-app`, `private-app`, `github-token`, or `auto`.
-  - In CI mode, `public-app` can fall back to workflow token; in release mode it requires broker exchange.
-- `scripts/request-public-app-token.sh` performs OIDC token retrieval from GitHub Actions, posts to broker `/token`, and emits short-lived installation token outputs.
+Worker (from `worker/`):
 
-### 3) Token broker worker (`worker/`)
-- Entrypoint: `worker/src/index.ts` (`handleRequest`), only serves `POST /token`.
-- Main flow:
-  - Parse and validate request (`oidcToken`, `owner`, `repo`).
-  - Verify GitHub OIDC JWT (`issuer` + expected audience).
-  - Enforce repository claim match and optional allow-list (`ALLOWED_REPOSITORIES`).
-  - Create GitHub App JWT from `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`.
-  - Discover installation and mint repo-scoped installation token with configured permissions.
-- Security/error handling behavior is heavily unit-tested in `worker/test/index.test.ts`, including non-leakage of upstream token payloads on failures.
+```bash
+npm install
+npm run typecheck
+npm test
+npm run check   # typecheck + tests + wrangler dry-run
+```
 
-### 4) Tests and validation layout
-- `tests/bake-print.sh` validates Docker Bake examples render.
-- `tests/bats/resolve-auth-token.bats` covers shell auth-token decision logic.
-- `worker/test/index.test.ts` validates broker request validation, OIDC checks, installation lookup, token creation, and key-format handling.
+## Architecture Notes
 
-### 5) Docs generation coupling
-- `docs/reference/action-inputs-outputs.md` is generated from `action.yml` by `scripts/generate-action-reference.py`.
-  - Inputs are grouped into labeled sections; the order and grouping are controlled by the `INPUT_GROUPS` constant in the generator.
-  - Inputs whose `action.yml` description contains indented `value  description` lines are automatically rendered as allowed-values tables.
-  - Outputs are rendered without internal implementation details (no `Value:` step references).
-  - Update generated docs by running `python scripts/generate-action-reference.py` after changing action inputs/outputs.
-- `mkdocs.yml` + `requirements-docs.txt` define docs build used by the Pages workflow.
-- `docs/release-runner-logo.png` is used as the MkDocs theme logo/favicon and displayed in the docs index and README.
+- `mode: ci` optionally enforces branch naming and builds/pushes Docker Bake
+  targets as `pr-<number>` tags.
+- `mode: ci` can also scan the assembled `pr-<N>` image (Trivy) and route a
+  CycloneDX SBOM to Dependency-Track and optional findings to DefectDojo, via
+  `scripts/scan-image.sh` and the `scripts/upload-*-{dependency-track,defectdojo}.sh`
+  uploaders. Reporting is visibility-first (non-blocking unless
+  `image-scan-gate`); sinks are failure-isolated; a scanner that cannot run is a
+  build error, not a finding.
+- `mode: release` resolves auth, determines the target environment, delegates
+  versioning to the selected backend, normalizes outputs, optionally promotes
+  Docker images, publishes GitHub Releases, and can create promotion PRs.
+  Before promoting a `pr-<N>` image it verifies the image's provenance labels
+  (stamped by `mode: ci`) against the release commit's git tree via
+  `scripts/verify-promote-source.sh`; stale or unverifiable images are rebuilt
+  from the release checkout instead of promoted.
+- `mode: enable-auto-merge` enables native GitHub auto-merge for a specific PR.
+- Auth selection is centralized in `scripts/resolve-auth-token.sh`; public-App
+  token exchange is requested by `scripts/request-public-app-token.sh`, which
+  calls the worker's broker endpoint.
+- The worker exposes `/token` (OIDC → App installation-token broker), `/sign`
+  (App/bot-attributed signed release commits), `/releases` (release history),
+  and a `push` auto-update webhook.
 
-### 6) README conventions
-- The README is scoped to the GitHub Marketplace action; detailed guides live in `docs/`.
-- The first line must be an H1 heading (`# Release Runner`) to satisfy the MD041 markdownlint rule.
-- Badges (CI, Release, Docs, Marketplace, License) and logo follow the heading.
-- Docs links in the README must match actual MkDocs heading anchors (e.g., `#release-write-token`, `#branch-protection-checklist`, `#2-choose-docker-or-version-only`).
-- Inline links are preferred over standalone "see the docs" sentences.
+## Editing Rules
 
-## Important repository conventions
-- The root CI workflow installs external tools (`shellcheck`, `actionlint`) before running `npm run ci`; local `lint:actions` requires `actionlint` to be available on PATH.
-- `npm run test:bake` expects Docker Buildx support locally; CI explicitly provisions Buildx before running repository checks.
-- For release behavior changes, keep `README.md` usage examples and `action.yml` inputs/outputs aligned.
-- Shell scripts (`scripts/*.sh`, `tests/*.sh`) must have executable permissions (`100755`) in Git. On Windows, use `git update-index --chmod=+x <file>` and set `git config core.filemode false` to prevent the working tree from reverting permissions.
-- `npm run lint:markdown` checks `README.md` and `CHANGELOG.md` with markdownlint; avoid consecutive blank lines (MD012) and ensure the first line is an H1 (MD041).
+- Preserve action input names, output names, defaults, and behavior unless the
+  user explicitly approves a breaking change.
+- Keep README examples aligned with `action.yml`.
+- Keep the worker self-contained (only `jose`); do not vendor pro/private code.
+- Shell scripts must remain executable in Git.
+- Never commit secrets, `.dev.vars`, build output, or caches (`node_modules/`,
+  `.wrangler/`, `coverage/`).

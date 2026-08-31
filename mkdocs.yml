@@ -1,27 +1,65 @@
-site_name: Release Runner
-site_description: Setup and reference documentation for calebsargeant/semantic-release@v1.
-repo_name: calebsargeant/semantic-release
-repo_url: https://github.com/calebsargeant/semantic-release
+site_name: Diatreme
+site_description: >-
+  Release and deployment orchestration: a GitHub Marketplace composite action
+  plus the hosted GitHub App broker that backs it.
+site_url: https://magmamoose.github.io/diatreme/
+repo_url: https://github.com/MagmaMoose/diatreme
+repo_name: MagmaMoose/diatreme
+docs_dir: docs
+
 theme:
   name: material
-  logo: release-runner-logo.png
-  favicon: release-runner-logo.png
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
   features:
-    - navigation.tabs
+    - navigation.instant
     - navigation.top
+    - content.code.copy
+    - toc.follow
+
 markdown_extensions:
   - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - toc:
       permalink: true
+
 nav:
   - Home: index.md
-  - Concepts: concepts.md
-  - Setup:
-      - Organization: organization-setup.md
-      - Choose your setup: choose-your-setup.md
-      - Repository: repository-setup.md
-  - Branching strategies: branching-strategies.md
+  - Setup: setup.md
+  - Using the action: action.md
+  - Architecture: architecture.md
+  - Broker: worker.md
+  - How-to:
+      - Releasing several packages: how-to/release-several-packages.md
   - Reference:
-      - Action inputs and outputs: reference/action-inputs-outputs.md
+      - Action: reference/action.md
+      - Broker API: reference/broker-api.md
+      - Broker configuration: reference/configuration.md
+      - Errors: reference/errors.md
+      - Limits: reference/limits.md
   - Operations:
-      - Rolling back a release: rollback.md
+      - Deployment: operations/deployment.md
+  - Security: security.md
+  - Glossary: glossary.md
+  - Contributing: contributing.md

@@ -17,24 +17,40 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '22'
           cache: npm
+          cache-dependency-path: worker/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
       - name: Validate worker
-        run: npm run worker:check
+        run: npm run check
+
+      # Bind the production KV namespace without committing the ID (keeps
+      # wrangler.jsonc clean for self-hosters). Set repo/org Actions variable
+      # COPILOT_QUOTA_KV_ID to the namespace ID; skipped when it's unset.
+      - name: Inject KV namespace bindings
+        if: ${{ vars.COPILOT_QUOTA_KV_ID != '' || vars.DIATREME_JWKS_CACHE_ID != '' }}
+        env:
+          KV_ID: ${{ vars.COPILOT_QUOTA_KV_ID }}
+          JWKS_KV_ID: ${{ vars.DIATREME_JWKS_CACHE_ID }}
+        run: |
+          # shellcheck disable=SC2016  # ${process.env.*} are JS templates, not shell
+          node -e 'const fs=require("fs");const f="wrangler.jsonc";const s=fs.readFileSync(f,"utf8");if(!s.includes("// __KV_NAMESPACES__")){console.error("KV marker missing");process.exit(1);}const b=[];if(process.env.KV_ID)b.push({binding:"COPILOT_QUOTA_KV",id:process.env.KV_ID});if(process.env.JWKS_KV_ID)b.push({binding:"DIATREME_JWKS_CACHE",id:process.env.JWKS_KV_ID});fs.writeFileSync(f,s.replace("// __KV_NAMESPACES__",`"kv_namespaces": ${JSON.stringify(b)},`));console.log("Injected bindings:",b.map(x=>x.binding).join(", ")||"(none)");'
 
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        uses: cloudflare/wrangler-action@ebbaa1584979971c8614a24965b4405ff95890e0 # v4.0.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

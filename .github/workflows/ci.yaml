@@ -11,30 +11,117 @@ permissions:
 
 jobs:
   validate:
-    name: Validate action, docs, examples, and worker
+    name: Validate action distribution
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '22'
-          cache: npm
-
-      - name: Install shellcheck
+      - name: Install shell tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y bats shellcheck
 
       - name: Install actionlint
         run: |
           bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
           echo "${PWD}" >> "$GITHUB_PATH"
 
-      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - name: Confirm single root action metadata file
+        run: |
+          set -euo pipefail
+          count="$(find . -maxdepth 1 \( -name action.yml -o -name action.yaml \) -print | wc -l | tr -d ' ')"
+          test "${count}" = "1"
+
+      - name: Parse action metadata
+        run: |
+          ruby -e 'require "yaml"; doc = YAML.load_file("action.yml"); abort "not composite" unless doc.dig("runs", "using") == "composite"; abort "missing name" unless doc["name"]'
+
+      - name: Run actionlint
+        run: actionlint -color=false
+
+      - name: ShellCheck runtime scripts
+        run: shellcheck -S warning scripts/*.sh
+
+      - name: Run Bats tests
+        run: bats tests/bats
+
+      # The bats suite stubs the `semantic-release` CLI, so nothing else here ever
+      # installs the pinned version. Without this step a Dependabot bump of
+      # scripts/psr-requirements.txt would land green and only break in a
+      # consumer's release run — psr failures never surface on a PR otherwise.
+      # Install the pin for real and assert it still speaks the argv that
+      # scripts/run-python-semantic-release.sh builds.
+      - name: Smoke-test the pinned python-semantic-release
+        run: |
+          set -euo pipefail
+          venv="${RUNNER_TEMP}/psr-smoke"
+          python3 -m venv "${venv}"
+          "${venv}/bin/python" -m pip install --disable-pip-version-check --quiet \
+            --requirement scripts/psr-requirements.txt
+          "${venv}/bin/semantic-release" --version
+
+          help="$("${venv}/bin/semantic-release" version --help)"
+          missing=()
+          for flag in --commit --no-vcs-release --skip-build --as-prerelease \
+                      --prerelease-token --changelog --no-changelog \
+                      --prerelease --patch --minor --major; do
+            # Trailing boundary so `--prerelease` cannot be satisfied by
+            # `--prerelease-token` alone.
+            grep -qE -- "${flag}([^A-Za-z0-9-]|\$)" <<<"${help}" || missing+=("${flag}")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::pinned python-semantic-release no longer accepts: ${missing[*]}"
+            exit 1
+          fi
+          echo "pinned CLI accepts every flag run-python-semantic-release.sh passes"
+
+          # `--version` and `version --help` never read a config, so they cannot
+          # see a psr/dependency combination that dies loading one. That is
+          # exactly how GitPython 3.1.60 reached consumers: it dropped
+          # `Actor.name_email_regex`, psr's `commit_author` validation read it,
+          # and every release run failed while this step stayed green. Resolve a
+          # version in a throwaway repo so the config path runs here too.
+          repo="${RUNNER_TEMP}/psr-smoke-repo"
+          rm -rf "${repo}"
+          mkdir -p "${repo}"
+          git -C "${repo}" init -q -b main
+          git -C "${repo}" config user.name psr-smoke
+          git -C "${repo}" config user.email psr-smoke@example.invalid
+          # psr resolves the hvcs from `origin`; nothing is fetched or pushed.
+          git -C "${repo}" remote add origin https://github.com/example/example.git
+          printf '[tool.semantic_release]\n' > "${repo}/pyproject.toml"
+          git -C "${repo}" add -A
+          git -C "${repo}" commit -qm 'feat: initial commit'
+          version="$(cd "${repo}" && "${venv}/bin/semantic-release" version --print)"
+          # Any semver will do; the point is that config load and version
+          # resolution completed, not which number psr's defaults produce.
+          if ! grep -qE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"${version}"; then
+            echo "::error::pinned python-semantic-release printed no version: '${version}'"
+            exit 1
+          fi
+          echo "pinned CLI loads a config and resolves a version"
+
+  worker:
+    name: Validate worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: worker/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run repository checks
-        run: npm run ci
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test

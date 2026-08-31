@@ -1,0 +1,62 @@
+# Org docs site — build strictly, publish to Cloudflare Pages, verify it serves.
+#
+# Provisioned by Caldrith from MagmaMoose/admin (files/workflows/docs.yml). Edit it
+# THERE, not here; a local edit is reconciled away on the next run.
+#
+# Cloudflare rather than GitHub Pages, for one reason that decides it: on the Team plan a
+# Pages site built from a PRIVATE repo is still served on the open internet (private
+# publishing is an Enterprise Cloud feature). Half this fleet is private and two repos are
+# proprietary, so GitHub Pages cannot host them at all without leaking them. Cloudflare
+# Access gates them properly, and using one target for every repo means one code path
+# rather than a permanent split maintained for a handful of repos.
+#
+# `docs.yml` is the CLOUDFLARE workflow — there is no `target:` input, because the host is
+# what picks the workflow. `docs-github-pages.yml` is the other one, and it needs
+# `pages: write` + `id-token: write` from its caller. Passing an input a reusable workflow
+# does not declare is a startup failure, not a warning.
+#
+# Everything below is one call. Toolchain (uv vs pip), the Pages project name, and project
+# creation on first deploy are all handled inside the action.
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'mkdocs.base.yml'
+      - 'README.md'
+      - '.markdownlint.jsonc'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'mkdocs.base.yml'
+      - 'README.md'
+      - '.markdownlint.jsonc'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    # SHA-pinned like every other managed reference. Caldrith's downgrade guard now
+    # recognises reusable-workflow pins (MagmaMoose/caldrith#86); before that fix it could
+    # not see this shape at all and would have fought Dependabot over it forever.
+    uses: MagmaMoose/tremvok/.github/workflows/docs.yml@1b49b1659f928ad7cb0c35a76b1e78a2fa16b3b7 # v1.0.7
+    # The Cloudflare credentials are org secrets available to every repo.
+    secrets: inherit
+    with:
+      runs-on: ubuntu-latest
+      # A pull request builds, lints and checks, but never deploys.
+      publish: ${{ github.event_name != 'pull_request' }}
+      # ENFORCED, not remembered. A Cloudflare Pages project is served on the open
+      # internet at <project>.pages.dev by default, so "the repo is private" gates
+      # nothing. With this set the action asks Cloudflare which Access applications
+      # exist and REFUSES to deploy unless one covers the hostname — so a private repo
+      # cannot publish before it is gated, whatever anyone forgets to configure.
+      require-access: False

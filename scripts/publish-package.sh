@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+# Pack and publish a language package to a configurable feed.
+#
+# Called by the "Publish package" step in action.yml (mode: release), gated on
+# `released == 'true'`, after Docker image promotion and before the GitHub
+# Release is published — so a downstream `release:published` listener finds the
+# package already available in the feed (same ordering rationale as the image
+# promote step).
+#
+# The published version is the one diatreme already computed (VERSION). The
+# prerelease/stable distinction is encoded in that string (e.g. 1.2.3-rc.1) and
+# each diatreme run targets a single environment, so environment/branch gating
+# is inherited from the caller's versioning gate — dev/staging runs publish
+# prerelease versions, prod runs publish stable versions, all on `released`.
+#
+# Required env:
+#   ECOSYSTEM   - nuget | pip | npm | maven | gradle | rubygems | container | s3
+#   VERSION     - semver to publish (e.g. 1.2.3 or 1.2.3-rc.1)
+#   TOKEN       - auth token / API key for the feed (not required for pip when
+#                 PYPI_TRUSTED_PUBLISHING=true — a token is minted via OIDC)
+#
+# Optional env:
+#   FEED_URL              - feed/registry URL. Defaults per-ecosystem (GitHub
+#                           Packages NuGet for OWNER / PyPI / npmjs.org).
+#                           REQUIRED for s3, as s3://bucket[/prefix].
+#   AWS_ROLE_TO_ASSUME    - role the caller's OIDC step assumed. REQUIRED for s3;
+#                           only verified here, so a missing credentials step
+#                           fails with a sentence rather than a 403 at upload.
+#   PACKAGE_PATH          - project file or directory to pack/build/publish.
+#                           Defaults to WORKING_DIRECTORY, then '.'.
+#   WORKING_DIRECTORY     - base directory (the action's working-directory).
+#   USERNAME              - feed/login username. pip/twine default '__token__';
+#                           maven/gradle/rubygems/container login default
+#                           'x-access-token'. Ignored by nuget and npm.
+#   OWNER                 - repo owner, used to derive GitHub Packages URLs.
+#   REPOSITORY            - owner/repo (github.repository). The default maven
+#                           feed and container image name are derived from it.
+#   PACKAGE_NAME          - container image name override (defaults to
+#                           REPOSITORY lowercased). Ignored by the others.
+#   IS_PRERELEASE         - true | false (selects the npm dist-tag).
+#   PRERELEASE_IDENTIFIER - e.g. dev, rc; npm dist-tag for prereleases
+#                           (falls back to 'next').
+#   NPM_PROVENANCE        - true | false. `npm publish --provenance` (public
+#                           npmjs only; needs id-token: write).
+#   PYPI_TRUSTED_PUBLISHING - true | false. Mint a PyPI upload token from the
+#                           workflow's GitHub OIDC identity instead of TOKEN
+#                           (public PyPI / TestPyPI only; needs id-token: write).
+#
+# Side effects:
+#   - Writes `published=true|false` to $GITHUB_OUTPUT when that var is set.
+#   - Masks TOKEN in the workflow log.
+#
+# Exit codes:
+#   0 - package published (re-runs are idempotent: nuget --skip-duplicate,
+#       twine --skip-existing, npm tolerates an already-published version)
+#   1 - misconfiguration or a publish error
+
+set -euo pipefail
+
+# ECOSYSTEM is validated by the case statement below (the '' branch gives an
+# actionable message) so an empty package-ecosystem input doesn't trip the
+# generic `set -u` unbound-variable error first.
+: "${VERSION:?VERSION is required}"
+
+# Mask the token in any log output before we do anything with it.
+if [ -n "${TOKEN:-}" ]; then
+  echo "::add-mask::${TOKEN}"
+fi
+
+emit_published() {
+  if [ -n "${GITHUB_OUTPUT:-}" ]; then
+    echo "published=$1" >> "${GITHUB_OUTPUT}"
+  fi
+}
+
+# Run a publish command, treating an "already published / version exists"
+# conflict as success — GitHub Packages (and npmjs) reject overwriting a
+# released version, so a re-run must be a no-op, not a hard failure. $1 is an
+# extended-regex of conflict messages to tolerate; the rest is the command.
+run_publish() {
+  local conflict_re="$1"; shift
+  local err rc=0
+  err="$(mktemp)"
+  "$@" 2>"${err}" || rc=$?
+  cat "${err}" >&2
+  if [ "${rc}" -ne 0 ]; then
+    if grep -qiE "${conflict_re}" "${err}"; then
+      echo "Already published — idempotent re-run, treating as success."
+    else
+      rm -f "${err}"
+      return "${rc}"
+    fi
+  fi
+  rm -f "${err}"
+  return 0
+}
+
+# Mint a short-lived PyPI/TestPyPI upload token from the ambient GitHub Actions
+# OIDC identity (PyPI "trusted publishing") — no stored secret. $1 is the PyPI
+# host (pypi.org | test.pypi.org), which also selects the OIDC audience. Prints
+# the minted token on stdout; on any failure prints a ::error:: line to stderr
+# and returns non-zero. Uses python (always present in the pip path) so we don't
+# add a jq/curl dependency.
+mint_pypi_token() {
+  local host="$1"
+  python - "${host}" <<'PY'
+import json, os, sys, urllib.error, urllib.request
+
+host = sys.argv[1]
+audience = "testpypi" if host == "test.pypi.org" else "pypi"
+try:
+    req_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+    req_tok = os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+except KeyError:
+    sys.exit("::error::pypi-trusted-publishing needs 'id-token: write' on the job "
+             "(ACTIONS_ID_TOKEN_REQUEST_URL is unset).")
+sep = "&" if "?" in req_url else "?"
+oidc_req = urllib.request.Request(req_url + sep + "audience=" + audience,
+                                  headers={"Authorization": "bearer " + req_tok})
+try:
+    oidc = json.load(urllib.request.urlopen(oidc_req))["value"]
+except Exception as exc:  # noqa: BLE001
+    sys.exit("::error::could not obtain a GitHub OIDC token: %s" % exc)
+mint_req = urllib.request.Request("https://%s/_/oidc/mint-token" % host,
+                                  data=json.dumps({"token": oidc}).encode(),
+                                  headers={"Content-Type": "application/json"})
+try:
+    resp = json.load(urllib.request.urlopen(mint_req))
+except urllib.error.HTTPError as exc:
+    body = exc.read().decode("utf-8", "replace")
+    sys.exit("::error::%s rejected the OIDC token (HTTP %s) — is a Trusted Publisher "
+             "configured for this repo+workflow? %s" % (host, exc.code, body))
+except Exception as exc:  # noqa: BLE001
+    sys.exit("::error::PyPI token mint failed: %s" % exc)
+token = resp.get("token")
+if not token:
+    sys.exit("::error::PyPI mint-token response had no 'token': %s" % json.dumps(resp))
+print(token)
+PY
+}
+
+OWNER_LOWER="$(printf '%s' "${OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+BASE_DIR="${WORKING_DIRECTORY:-.}"
+[ -z "${BASE_DIR}" ] && BASE_DIR="."
+TARGET="${PACKAGE_PATH:-}"
+IS_PRERELEASE="${IS_PRERELEASE:-false}"
+
+case "${ECOSYSTEM:-}" in
+  nuget)
+    : "${TOKEN:?TOKEN is required for nuget publishing}"
+    FEED="${FEED_URL:-}"
+    if [ -z "${FEED}" ]; then
+      if [ -z "${OWNER_LOWER}" ]; then
+        echo "::error::package-feed-url is empty and the repository owner is unknown; cannot derive a GitHub Packages NuGet feed."
+        exit 1
+      fi
+      FEED="https://nuget.pkg.github.com/${OWNER_LOWER}/index.json"
+      echo "No package-feed-url set — defaulting to GitHub Packages: ${FEED}"
+    fi
+
+    PROJECT="${TARGET:-${BASE_DIR}}"
+    OUT_DIR="$(mktemp -d)"
+
+    echo "dotnet pack '${PROJECT}' → ${VERSION}"
+    dotnet pack "${PROJECT}" \
+      --configuration Release \
+      -p:Version="${VERSION}" \
+      -p:PackageVersion="${VERSION}" \
+      --output "${OUT_DIR}"
+
+    shopt -s nullglob
+    PKGS=("${OUT_DIR}"/*.nupkg)
+    shopt -u nullglob
+    if [ "${#PKGS[@]}" -eq 0 ]; then
+      echo "::error::dotnet pack produced no .nupkg files in ${OUT_DIR}. Check that '${PROJECT}' is a packable project (<IsPackable> not false)."
+      exit 1
+    fi
+
+    for pkg in "${PKGS[@]}"; do
+      echo "dotnet nuget push '$(basename "${pkg}")' → ${FEED}"
+      # --skip-duplicate makes re-runs (or a parallel run that already
+      # pushed this version) a no-op instead of a hard failure.
+      dotnet nuget push "${pkg}" \
+        --source "${FEED}" \
+        --api-key "${TOKEN}" \
+        --skip-duplicate
+    done
+    ;;
+
+  pip)
+    FEED="${FEED_URL:-}"          # empty → PyPI default
+    USER="${USERNAME:-}"
+    [ -z "${USER}" ] && USER="__token__"
+    if [ "${PYPI_TRUSTED_PUBLISHING:-false}" = "true" ]; then
+      # Tokenless: mint a short-lived token from the workflow's OIDC identity.
+      # Only public PyPI / TestPyPI expose the mint endpoint we target; private
+      # indexes must keep using package-token.
+      case "${FEED}" in
+        "")                                MINT_HOST="pypi.org" ;;
+        *test.pypi.org*)                   MINT_HOST="test.pypi.org" ;;
+        https://pypi.org*|*upload.pypi.org*) MINT_HOST="pypi.org" ;;
+        *)
+          echo "::error::pypi-trusted-publishing is only supported for public PyPI / TestPyPI, not '${FEED}'. Use package-token for private indexes."
+          exit 1
+          ;;
+      esac
+      echo "Minting a short-lived ${MINT_HOST} token via GitHub OIDC (trusted publishing)…"
+      if ! TOKEN="$(mint_pypi_token "${MINT_HOST}")"; then
+        exit 1
+      fi
+      echo "::add-mask::${TOKEN}"
+      USER="__token__"
+    else
+      : "${TOKEN:?TOKEN is required for pip publishing (set pypi-trusted-publishing: true to mint one via GitHub OIDC for public PyPI instead).}"
+    fi
+    SRC_DIR="${TARGET:-${BASE_DIR}}"
+    # Build into a fresh temp dir (not ${SRC_DIR}/dist) so only this run's
+    # artifacts are uploaded — a pre-existing/checked-in dist/ would otherwise
+    # get swept up by the glob below. Mirrors the nuget path's mktemp -d.
+    DIST_DIR="$(mktemp -d)/dist"
+
+    echo "python -m build '${SRC_DIR}'"
+    python -m pip install --upgrade build twine >/dev/null
+    # The built version comes from the project metadata (pyproject.toml /
+    # setup.py). semantic-release-python bumps and commits that before this
+    # step, so the build matches VERSION; with other tools, persist VERSION
+    # into the project (e.g. the action's `version-file` input) first.
+    python -m build --outdir "${DIST_DIR}" "${SRC_DIR}"
+
+    shopt -s nullglob
+    DISTS=("${DIST_DIR}"/*)
+    shopt -u nullglob
+    if [ "${#DISTS[@]}" -eq 0 ]; then
+      echo "::error::python -m build produced no artifacts in ${DIST_DIR}."
+      exit 1
+    fi
+
+    UPLOAD_ARGS=(upload --non-interactive --skip-existing)
+    if [ -n "${FEED}" ]; then
+      UPLOAD_ARGS+=(--repository-url "${FEED}")
+      echo "twine upload → ${FEED}"
+    else
+      echo "twine upload → PyPI"
+    fi
+    UPLOAD_ARGS+=("${DISTS[@]}")
+    # Credentials via env so they never appear in argv/process listings.
+    TWINE_USERNAME="${USER}" TWINE_PASSWORD="${TOKEN}" \
+      python -m twine "${UPLOAD_ARGS[@]}"
+    ;;
+
+  npm)
+    : "${TOKEN:?TOKEN is required for npm publishing}"
+    FEED="${FEED_URL:-}"
+    [ -z "${FEED}" ] && FEED="https://registry.npmjs.org"
+    NPM_PROVENANCE="${NPM_PROVENANCE:-false}"
+    if [ "${NPM_PROVENANCE}" = "true" ]; then
+      # Provenance attestations are only accepted by the public npm registry.
+      case "${FEED}" in
+        https://registry.npmjs.org|https://registry.npmjs.org/) : ;;
+        *)
+          echo "::error::npm-provenance is only supported when publishing to the public npm registry (registry.npmjs.org), not '${FEED}'."
+          exit 1
+          ;;
+      esac
+      # The npm CLI signs the attestation with the job's OIDC identity.
+      if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+        echo "::error::npm-provenance needs 'id-token: write' on the job (ACTIONS_ID_TOKEN_REQUEST_URL is unset)."
+        exit 1
+      fi
+    fi
+    PKG_DIR="${TARGET:-${BASE_DIR}}"
+    # Accept a package.json path as well as a directory.
+    if [ -f "${PKG_DIR}" ]; then
+      PKG_DIR="$(dirname "${PKG_DIR}")"
+    fi
+    cd "${PKG_DIR}" || { echo "::error::npm package directory '${PKG_DIR}' not found."; exit 1; }
+
+    # Strip the scheme to the //host/path form npm uses for _authToken, and
+    # drop any trailing slash so the key matches the registry npm computes.
+    REG_KEY="$(printf '%s' "${FEED}" | sed -E 's#^[a-zA-Z]+:##; s#/+$##')"
+    # Write auth to a throwaway userconfig outside the working tree (removed on
+    # exit) instead of appending it to a .npmrc in the package dir — the latter
+    # leaves the token on disk in the checkout and could clobber an existing
+    # .npmrc.
+    NPMRC="$(mktemp)"
+    trap 'rm -f "${NPMRC}"' EXIT
+    {
+      echo "registry=${FEED}"
+      echo "${REG_KEY}/:_authToken=${TOKEN}"
+    } > "${NPMRC}"
+    export npm_config_userconfig="${NPMRC}"
+
+    # Align package.json with the released version (no-op if already there).
+    npm version "${VERSION}" --no-git-tag-version --allow-same-version >/dev/null
+
+    PUBLISH_ARGS=(publish --registry "${FEED}")
+    if [ "${NPM_PROVENANCE}" = "true" ]; then
+      PUBLISH_ARGS+=(--provenance)
+      echo "npm provenance: on (--provenance)"
+    fi
+    if [ "${IS_PRERELEASE}" = "true" ]; then
+      # Keep prereleases off the default `latest` dist-tag so consumers don't
+      # pick them up implicitly. Use the environment's prerelease identifier
+      # (dev, rc, …) as the tag, falling back to `next`.
+      DIST_TAG="${PRERELEASE_IDENTIFIER:-next}"
+      [ -z "${DIST_TAG}" ] && DIST_TAG="next"
+      PUBLISH_ARGS+=(--tag "${DIST_TAG}")
+      echo "npm publish → ${FEED} (dist-tag: ${DIST_TAG})"
+    else
+      echo "npm publish → ${FEED} (dist-tag: latest)"
+    fi
+    # npm publish errors if the version already exists; tolerate that so re-runs
+    # are idempotent like the nuget/twine paths.
+    run_publish 'cannot publish over|previously published|EPUBLISHCONFLICT' \
+      npm "${PUBLISH_ARGS[@]}"
+    ;;
+
+  maven)
+    : "${TOKEN:?TOKEN is required for maven publishing}"
+    POM="${TARGET:-${BASE_DIR}}"
+    [ -d "${POM}" ] && POM="${POM%/}/pom.xml"
+    if [ ! -f "${POM}" ]; then
+      echo "::error::maven: no pom.xml at '${POM}'. Point package-path at the project dir or its pom.xml."
+      exit 1
+    fi
+    FEED="${FEED_URL:-}"
+    if [ -z "${FEED}" ]; then
+      if [ -z "${REPOSITORY:-}" ]; then
+        echo "::error::package-feed-url is empty and the repository (owner/repo) is unknown; cannot derive a GitHub Packages Maven feed."
+        exit 1
+      fi
+      FEED="https://maven.pkg.github.com/${REPOSITORY}"
+      echo "No package-feed-url set — defaulting to GitHub Packages: ${FEED}"
+    fi
+    # Per-run settings.xml with the feed credentials (server id 'github' matches
+    # the altDeploymentRepository id below). Written outside the project tree and
+    # removed on exit so the token isn't left on disk.
+    SETTINGS="$(mktemp)"
+    trap 'rm -f "${SETTINGS}"' EXIT
+    cat > "${SETTINGS}" <<XML
+<settings>
+  <servers>
+    <server>
+      <id>github</id>
+      <username>${USERNAME:-x-access-token}</username>
+      <password>${TOKEN}</password>
+    </server>
+  </servers>
+</settings>
+XML
+    echo "mvn deploy '${POM}' → ${FEED} (version ${VERSION})"
+    mvn --batch-mode --no-transfer-progress -f "${POM}" \
+      versions:set -DnewVersion="${VERSION}" -DgenerateBackupPoms=false
+    # altDeploymentRepository in the 'id::url' form (Maven 3.9+, the runner default).
+    run_publish '409|status code: ?409|already exists|cannot be deployed|Conflict' \
+      mvn --batch-mode --no-transfer-progress -f "${POM}" --settings "${SETTINGS}" \
+        -DskipTests -DaltDeploymentRepository="github::${FEED}" deploy
+    ;;
+
+  gradle)
+    : "${TOKEN:?TOKEN is required for gradle publishing}"
+    PROJECT_DIR="${TARGET:-${BASE_DIR}}"
+    [ -f "${PROJECT_DIR}" ] && PROJECT_DIR="$(dirname "${PROJECT_DIR}")"
+    cd "${PROJECT_DIR}" || { echo "::error::gradle project dir '${PROJECT_DIR}' not found."; exit 1; }
+    GRADLE_BIN="gradle"
+    [ -x ./gradlew ] && GRADLE_BIN="./gradlew"
+    # Gradle publishing is defined by the project's maven-publish block. Pass the
+    # version (-Pversion) and the credentials the GitHubPackages repository
+    # conventionally reads — GITHUB_ACTOR/GITHUB_TOKEN and the gpr.* project
+    # properties — via env so they never reach argv.
+    echo "${GRADLE_BIN} publish (version ${VERSION}) → ${FEED_URL:-GitHub Packages (maven)}"
+    run_publish '409|Conflict|already exists|received status code 409' \
+      env GITHUB_ACTOR="${USERNAME:-x-access-token}" GITHUB_TOKEN="${TOKEN}" \
+          ORG_GRADLE_PROJECT_gprUser="${USERNAME:-x-access-token}" \
+          ORG_GRADLE_PROJECT_gprToken="${TOKEN}" \
+          ORG_GRADLE_PROJECT_githubToken="${TOKEN}" \
+        "${GRADLE_BIN}" --no-daemon publish -Pversion="${VERSION}"
+    ;;
+
+  rubygems)
+    : "${TOKEN:?TOKEN is required for rubygems publishing}"
+    FEED="${FEED_URL:-}"
+    if [ -z "${FEED}" ]; then
+      if [ -z "${OWNER_LOWER}" ]; then
+        echo "::error::package-feed-url is empty and the repository owner is unknown; cannot derive a GitHub Packages RubyGems host."
+        exit 1
+      fi
+      FEED="https://rubygems.pkg.github.com/${OWNER_LOWER}"
+      echo "No package-feed-url set — defaulting to GitHub Packages: ${FEED}"
+    fi
+    SRC_DIR="${TARGET:-${BASE_DIR}}"
+    [ -f "${SRC_DIR}" ] && SRC_DIR="$(dirname "${SRC_DIR}")"
+    cd "${SRC_DIR}" || { echo "::error::rubygems project dir '${SRC_DIR}' not found."; exit 1; }
+    shopt -s nullglob
+    GEMSPECS=(*.gemspec)
+    shopt -u nullglob
+    if [ "${#GEMSPECS[@]}" -eq 0 ]; then
+      echo "::error::rubygems: no .gemspec in '${SRC_DIR}'. The gemspec must carry the released version."
+      exit 1
+    fi
+    GEM_OUT="$(mktemp -d)"
+    for spec in "${GEMSPECS[@]}"; do
+      echo "gem build '${spec}'"
+      gem build "${spec}" --output "${GEM_OUT}/$(basename "${spec%.gemspec}").gem"
+    done
+    for gem in "${GEM_OUT}"/*.gem; do
+      echo "gem push '$(basename "${gem}")' → ${FEED}"
+      # API key via env (off argv); 'Bearer <token>' is what GitHub Packages wants.
+      run_publish 'already exists|already been pushed|conflict|status: ?422' \
+        env GEM_HOST_API_KEY="Bearer ${TOKEN}" gem push --host "${FEED}" "${gem}"
+    done
+    ;;
+
+  container)
+    : "${TOKEN:?TOKEN is required for container publishing}"
+    REGISTRY="${FEED_URL:-ghcr.io}"
+    REGISTRY="${REGISTRY#http://}"; REGISTRY="${REGISTRY#https://}"; REGISTRY="${REGISTRY%/}"
+    IMAGE_NAME="${PACKAGE_NAME:-}"
+    [ -z "${IMAGE_NAME}" ] && IMAGE_NAME="$(printf '%s' "${REPOSITORY:-${OWNER_LOWER}}" | tr '[:upper:]' '[:lower:]')"
+    if [ -z "${IMAGE_NAME}" ]; then
+      echo "::error::container: cannot determine the image name. Set package-name (or provide the repository)."
+      exit 1
+    fi
+    CONTEXT="${TARGET:-${BASE_DIR}}"
+    IMAGE_REF="${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+    echo "docker login ${REGISTRY}"
+    printf '%s' "${TOKEN}" | docker login "${REGISTRY}" --username "${USERNAME:-x-access-token}" --password-stdin
+    echo "docker build + push → ${IMAGE_REF}"
+    docker build --tag "${IMAGE_REF}" "${CONTEXT}"
+    # docker push overwrites a mutable tag, so a re-run is naturally idempotent.
+    docker push "${IMAGE_REF}"
+    ;;
+
+  s3)
+    # A built artifact to an S3 object store, under a VERSION-SCOPED, IMMUTABLE key.
+    #
+    # Unlike the language ecosystems above, there is no pack step: the artifact is whatever
+    # PACKAGE_PATH points at, already built by the caller. That is the point — a Lambda zip, a
+    # signed binary, a firmware image and a tarball are all the same thing to a bucket, and
+    # inventing a pack convention per artifact type is how this stops being reusable.
+    #
+    # AUTH IS OIDC, never a long-lived key, matching PYPI_TRUSTED_PUBLISHING above:
+    # AWS_ROLE_TO_ASSUME is assumed from the workflow's own GitHub identity, so the publishing
+    # repo holds no AWS credential at all and the role's trust policy is what decides who may
+    # publish. Needs `id-token: write` on the job.
+    #
+    # IDEMPOTENT BY REFUSAL, which is deliberately stricter than the others. nuget skips
+    # duplicates and docker overwrites a mutable tag; here an existing key means the version
+    # was already published, and silently overwriting it would swap the bytes under a version
+    # someone has already reviewed and pinned. A re-run is a no-op that reports success.
+    : "${FEED_URL:?FEED_URL is required for s3 publishing (e.g. s3://my-bucket/edge)}"
+    : "${AWS_ROLE_TO_ASSUME:?AWS_ROLE_TO_ASSUME is required for s3 publishing}"
+
+    ARTIFACT="${TARGET:-${BASE_DIR}}"
+    if [ ! -f "${ARTIFACT}" ]; then
+      echo "::error::s3: package-path must be the built artifact FILE. Not a file: ${ARTIFACT}"
+      exit 1
+    fi
+
+    DEST="${FEED_URL#s3://}"; DEST="${DEST%/}"
+    S3_BUCKET="${DEST%%/*}"
+    S3_PREFIX=""
+    [ "${DEST}" != "${S3_BUCKET}" ] && S3_PREFIX="${DEST#*/}/"
+    # Derive the extension from the basename only: a path like `build.out/myapp` would
+    # otherwise strip to `out/myapp`, embedding a slash in the key. Omit the extension
+    # entirely for extensionless artifacts (binaries, firmware images).
+    BASENAME="${ARTIFACT##*/}"
+    if [ "${BASENAME}" = "${BASENAME%.*}" ]; then
+      S3_KEY="${S3_PREFIX}${VERSION}"
+    else
+      S3_KEY="${S3_PREFIX}${VERSION}.${BASENAME##*.}"
+    fi
+
+    echo "aws sts assume-role-with-web-identity → ${AWS_ROLE_TO_ASSUME}"
+    # `aws-actions/configure-aws-credentials` in the caller's workflow is the supported path
+    # and leaves the session in the environment; this only verifies it happened, so that a
+    # missing OIDC step fails here with a sentence rather than at the upload with a 403.
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+      echo "::error::s3: no usable AWS session. Add aws-actions/configure-aws-credentials with"
+      echo "::error::  role-to-assume: ${AWS_ROLE_TO_ASSUME}"
+      echo "::error::before this action, and give the job 'id-token: write'."
+      exit 1
+    fi
+
+    if HEAD_ERR=$(aws s3api head-object --bucket "${S3_BUCKET}" --key "${S3_KEY}" 2>&1); then
+      echo "s3://${S3_BUCKET}/${S3_KEY} already published — nothing to do."
+      emit_published "false"
+      exit 0
+    elif echo "${HEAD_ERR}" | grep -qiE "403|AccessDenied|Forbidden"; then
+      echo "::error::s3: AccessDenied on s3:head-object for ${S3_KEY}."
+      echo "::error::  The role must include s3:GetObject (or s3:ListBucket) alongside"
+      echo "::error::  s3:PutObject so immutability can be verified before writing."
+      echo "::error::  See the IAM permissions section in README."
+      exit 1
+    fi
+
+    echo "aws s3api put-object → s3://${S3_BUCKET}/${S3_KEY}"
+    # SHA256 checksum so a consumer can verify the object without downloading it, and so a
+    # caller can compare digests to decide whether anything changed.
+    aws s3api put-object \
+      --bucket "${S3_BUCKET}" \
+      --key "${S3_KEY}" \
+      --body "${ARTIFACT}" \
+      --checksum-algorithm SHA256 \
+      >/dev/null
+    ;;
+
+  '')
+    echo "::error::publish-package is true but package-ecosystem is empty. Set package-ecosystem to nuget, pip, npm, maven, gradle, rubygems, container, or s3."
+    exit 1
+    ;;
+
+  *)
+    echo "::error::Unsupported package-ecosystem '${ECOSYSTEM}'. Use nuget, pip, npm, maven, gradle, rubygems, container, or s3."
+    exit 1
+    ;;
+esac
+
+echo "Published ${ECOSYSTEM} package version ${VERSION}."
+emit_published "true"
