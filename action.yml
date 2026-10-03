@@ -1273,11 +1273,11 @@ runs:
 
     - name: Set up QEMU
       if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
-      uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
     - name: Set up Docker Buildx (CI)
       if: inputs.mode == 'ci' && steps.resolve-image.outputs.image_name != ''
-      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       with:
         # Self-hosted docker-in-docker runners (e.g. a k3s cluster) have a reduced
         # pod-network MTU (flannel VXLAN ~1450), but buildkit's default CNI bridge for
@@ -2137,7 +2137,7 @@ runs:
 
     - name: Set up Docker Buildx (release)
       if: inputs.mode == 'release' && steps.resolve-image.outputs.image_name != '' && steps.normalize.outputs.released == 'true'
-      uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       with:
         # See the CI Buildx step: run buildkit + RUN sandboxes on the host network so
         # docker-in-docker self-hosted runners with a reduced pod MTU (flannel VXLAN
@@ -2606,7 +2606,7 @@ runs:
         inputs.publish-package == 'true' &&
         (inputs.package-ecosystem == 'maven' || inputs.package-ecosystem == 'gradle') &&
         steps.normalize.outputs.released == 'true'
-      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
       with:
         distribution: ${{ inputs.java-distribution }}
         java-version: ${{ inputs.java-version }}
@@ -2617,7 +2617,7 @@ runs:
         inputs.publish-package == 'true' &&
         inputs.package-ecosystem == 'rubygems' &&
         steps.normalize.outputs.released == 'true'
-      uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+      uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1.327.0
       with:
         ruby-version: ${{ inputs.ruby-version }}
 

@@ -53,7 +53,7 @@ jobs:
     # self-hosted runners bomb out.
     runs-on: ubuntu-latest
     steps:
-      - uses: magmamoose/chargate@528a42e1b92ca2bf62e5f9b3bc79a7982b0058a2 # v2.11.27
+      - uses: magmamoose/chargate@e5e1ca4dfa613d1059611797955f70436f143159 # v2.11.67
         with:
           defectdojo_url: ${{ vars.MM_DEFECTDOJO_URL }}
           defectdojo_token: ${{ secrets.MM_DEFECTDOJO_API_KEY }}
